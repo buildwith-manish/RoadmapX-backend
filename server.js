@@ -22,6 +22,7 @@ app.use(cors({
     "http://127.0.0.1:3000",
     "https://roadmapx.onrender.com",
     "https://roadmapx.pages.dev"
+    "https://roadmapx-frontend.pages.dev"
   ],
   credentials: true
 }));
