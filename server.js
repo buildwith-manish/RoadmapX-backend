@@ -277,10 +277,20 @@ app.post("/logout", (req, res) => {
 });
 
 // ── GOOGLE SIGN-IN ──────────────────────────────────────
-const { OAuth2Client } = require("google-auth-library");
-const gsiClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+let OAuth2Client, gsiClient;
+try {
+  ({ OAuth2Client } = require("google-auth-library"));
+  if (process.env.GOOGLE_CLIENT_ID) {
+    gsiClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+  }
+} catch (e) {
+  console.warn("google-auth-library not available, Google Sign-In disabled.");
+}
 
 app.post("/auth/google", async (req, res) => {
+  if (!gsiClient) {
+    return res.status(503).json({ success: false, message: "Google Sign-In not configured." });
+  }
   try {
     const { credential } = req.body;
     if (!credential)
