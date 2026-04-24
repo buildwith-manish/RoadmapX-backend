@@ -51,7 +51,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET || "change-me-in-env",
   resave: false,
   saveUninitialized: false,
-  store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
+  store: MongoStore({ mongoUrl: process.env.MONGO_URI }),
   cookie: {
     httpOnly: true,
     // FIX: cross-origin cookies (Cloudflare→Render) MUST be sameSite:"none"
