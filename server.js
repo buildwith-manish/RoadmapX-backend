@@ -19,7 +19,7 @@ const mongoose   = require("mongoose");
 const cors       = require("cors");
 const bcrypt     = require("bcryptjs");
 const session    = require("express-session");
-const MongoStore = require("connect-mongo"); // FIX: clean import, no broken fallback
+const MongoStore = require("connect-mongo").default || require("connect-mongo"); // v5+/v6 compat
 const app        = express();
 
 // ───────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET || "change-me-in-env",
   resave: false,
   saveUninitialized: false,
-  store: MongoStore({ mongoUrl: process.env.MONGO_URI }),
+  store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
   cookie: {
     httpOnly: true,
     // FIX: cross-origin cookies (Cloudflare→Render) MUST be sameSite:"none"
