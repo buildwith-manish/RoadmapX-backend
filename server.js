@@ -26,22 +26,33 @@ const app        = express();
 //  MIDDLEWARE
 // ───────────────────────────────────────────────────────
 
-// FIX: In production (Cloudflare → Render) the request is cross-origin,
-// so we need sameSite:"none" + secure:true for the cookie to be sent.
-// In development (localhost) sameSite:"lax" is fine.
-const IS_PROD = process.env.NODE_ENV === "production";
+// FIX 1: Trust Render proxy so Express sees HTTPS correctly.
+// Without this, secure cookies never get set even on HTTPS.
+app.set("trust proxy", 1);
 
+// FIX 2: Render does NOT auto-set NODE_ENV="production".
+// Use the RENDER env var (always "true" on Render) as the reliable check.
+const IS_PROD = process.env.RENDER === "true" || process.env.NODE_ENV === "production";
+
+// FIX 3: CORS with function-based origin for better cross-origin cookie support.
 app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5500",         // Live Server for local dev
-    "http://127.0.0.1:5500",
-    "https://roadmapx.onrender.com",
-    "https://roadmapx.pages.dev",
-    "https://roadmapx-frontend.pages.dev",
-  ],
-  credentials: true,  // Required so the browser sends the session cookie
+  origin: function (origin, callback) {
+    const allowed = [
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://localhost:5500",
+      "http://127.0.0.1:5500",
+      "https://roadmapx.onrender.com",
+      "https://roadmapx.pages.dev",
+      "https://roadmapx-frontend.pages.dev",
+    ];
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS: origin not allowed: " + origin));
+    }
+  },
+  credentials: true,
 }));
 
 app.use(express.json());
@@ -54,11 +65,12 @@ app.use(session({
   store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
   cookie: {
     httpOnly: true,
-    // FIX: cross-origin cookies (Cloudflare→Render) MUST be sameSite:"none"
-    // and secure:true. In dev we use "lax" so it works without HTTPS.
+    // Cross-origin (Cloudflare Pages -> Render) REQUIRES sameSite:"none" + secure:true.
+    // sameSite:"lax" silently drops cookies on cross-origin requests,
+    // causing the "logged in but redirected back to login" bug.
     sameSite: IS_PROD ? "none" : "lax",
     secure:   IS_PROD,
-    maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days default
+    maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days
   },
 }));
 
