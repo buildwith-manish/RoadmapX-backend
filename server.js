@@ -1,45 +1,64 @@
 // ═══════════════════════════════════════════════════════
-//  RoadmapX — Backend Server
+//  RoadmapX — Backend Server (UPDATED)
 //  Stack: Node.js + Express + MongoDB (Mongoose)
+//
+//  KEY CHANGES vs original:
+//  1. All data models (Notes, Pomodoro, Attendance, etc.)
+//     now carry a `userId` field so data is per-user, not global.
+//  2. New unified GET /api/user-data + POST /api/user-data
+//     endpoints for the hybrid localStorage ↔ backend system.
+//  3. CORS cookie fix: sameSite "none" + secure:true in
+//     production so the cross-origin Cloudflare→Render cookie works.
+//  4. Fixed connect-mongo import (no broken || fallback).
+//  5. Fixed typo on /register comment.
+//  6. All existing routes updated to scope queries by userId.
 // ═══════════════════════════════════════════════════════
 require('dotenv').config();
 const express    = require("express");
 const mongoose   = require("mongoose");
 const cors       = require("cors");
-const bcrypt = require("bcryptjs");
+const bcrypt     = require("bcryptjs");
 const session    = require("express-session");
-const MongoStore = require("connect-mongo").default || require("connect-mongo");
+const MongoStore = require("connect-mongo"); // FIX: clean import, no broken fallback
 const app        = express();
 
 // ───────────────────────────────────────────────────────
 //  MIDDLEWARE
 // ───────────────────────────────────────────────────────
 
-// FIX: cors must allow credentials so the session cookie works
+// FIX: In production (Cloudflare → Render) the request is cross-origin,
+// so we need sameSite:"none" + secure:true for the cookie to be sent.
+// In development (localhost) sameSite:"lax" is fine.
+const IS_PROD = process.env.NODE_ENV === "production";
+
 app.use(cors({
   origin: [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:5500",         // Live Server for local dev
+    "http://127.0.0.1:5500",
     "https://roadmapx.onrender.com",
     "https://roadmapx.pages.dev",
-    "https://roadmapx-frontend.pages.dev"
+    "https://roadmapx-frontend.pages.dev",
   ],
-  credentials: true
+  credentials: true,  // Required so the browser sends the session cookie
 }));
 
 app.use(express.json());
 
 app.use(session({
   name:   "rx_sid",
-  secret: process.env.SESSION_SECRET || "change-me",
+  secret: process.env.SESSION_SECRET || "change-me-in-env",
   resave: false,
   saveUninitialized: false,
   store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
   cookie: {
     httpOnly: true,
-    sameSite: "lax",
-    secure:   process.env.NODE_ENV === "production", // false in dev
-    maxAge:   7 * 24 * 60 * 60 * 1000,              // 7 days default
+    // FIX: cross-origin cookies (Cloudflare→Render) MUST be sameSite:"none"
+    // and secure:true. In dev we use "lax" so it works without HTTPS.
+    sameSite: IS_PROD ? "none" : "lax",
+    secure:   IS_PROD,
+    maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days default
   },
 }));
 
@@ -50,14 +69,14 @@ app.use(express.static(__dirname));
 // ───────────────────────────────────────────────────────
 mongoose
   .connect(process.env.MONGO_URI)
-  .then(() => console.log("MongoDB Connected"))
-  .catch((err) => console.error("MongoDB connection error:", err));
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch((err) => console.error("❌ MongoDB connection error:", err));
 
 // ═══════════════════════════════════════════════════════
 //  SCHEMAS & MODELS
 // ═══════════════════════════════════════════════════════
 
-// 1. User — FIX: store passwordHash not plain password
+// 1. User — stores passwordHash (never plaintext)
 const userSchema = new mongoose.Schema({
   username:     { type: String, required: true, unique: true, trim: true },
   passwordHash: { type: String, required: true },
@@ -67,38 +86,99 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
-// 2. Attendance
+// 2. Unified UserData — this is the heart of the hybrid system.
+//    One document per user, contains all app data in one place.
+//    Using a single document makes atomic updates simple and avoids
+//    N+1 queries. We use upsert (create-or-update) on every save.
+const userDataSchema = new mongoose.Schema({
+  userId: { type: String, required: true, unique: true },  // = username
+  // Streak: stores per-type streak info (ai, dsa, proj, extra)
+  streaks: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  // Notes: stores extra/project notes (AI+DSA notes go through /save-text)
+  notes: {
+    type: [mongoose.Schema.Types.Mixed],
+    default: [],
+  },
+  // Badges: array of earned badge IDs
+  badges: {
+    type: [String],
+    default: [],
+  },
+  // Pomodoro stats: { ai: N, dsa: N, projects: N, extra: N }
+  pomodoroStats: {
+    type: mongoose.Schema.Types.Mixed,
+    default: { ai: 0, dsa: 0, projects: 0, extra: 0 },
+  },
+  // AI & DSA progress (day/topic completion maps)
+  aiProgress: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  dsaProgress: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  // Attendance calendar { "YYYY-MM-DD": "present"|"absent" }
+  attendance: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  // Revisions list
+  revisions: {
+    type: [mongoose.Schema.Types.Mixed],
+    default: [],
+  },
+  // Projects list
+  projects: {
+    type: [mongoose.Schema.Types.Mixed],
+    default: [],
+  },
+  // Pomodoro duration setting
+  pomoDuration: { type: Number, default: 25 },
+
+  updatedAt: { type: Date, default: Date.now },
+});
+const UserData = mongoose.model("UserData", userDataSchema);
+
+// 3. Attendance (legacy — kept for backwards compat, now scoped by userId)
 const attendanceSchema = new mongoose.Schema({
+  userId:    { type: String, required: true },  // FIX: added userId
   date:      { type: String, required: true },
   status:    { type: String, enum: ["present", "absent"], required: true },
   createdAt: { type: Date, default: Date.now },
 });
 const Attendance = mongoose.model("Attendance", attendanceSchema);
 
-// 3. Progress
+// 4. Progress (legacy, now scoped by userId)
 const progressSchema = new mongoose.Schema({
+  userId:    { type: String, required: true },  // FIX: added userId
   topic:     { type: String, required: true },
   completed: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });
 const Progress = mongoose.model("Progress", progressSchema);
 
-// 4. Notes
+// 5. Notes (legacy /save-text endpoint, now scoped by userId)
 const noteSchema = new mongoose.Schema({
+  userId:    { type: String, required: true },  // FIX: added userId
   title:     { type: String, required: true },
   content:   { type: String, required: true },
   createdAt: { type: Date, default: Date.now },
 });
 const Note = mongoose.model("Note", noteSchema);
 
-// 5. Pomodoro
+// 6. Pomodoro sessions (legacy, now scoped by userId)
 const pomodoroSchema = new mongoose.Schema({
+  userId:  { type: String, required: true },  // FIX: added userId
   minutes: { type: Number, required: true },
   date:    { type: Date, default: Date.now },
 });
 const Pomodoro = mongoose.model("Pomodoro", pomodoroSchema);
 
-// 6. Roadmap
+// 7. Roadmap (legacy)
 const roadmapSchema = new mongoose.Schema({
   level: { type: String, required: true },
   week:  { type: Number, required: true },
@@ -120,30 +200,24 @@ function requireAuth(req, res, next) {
 
 // ── AUTH ─────────────────────────────────────────────────
 
-// wPOST /register
+// POST /register
 app.post("/register", async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    if (!username || !password) {
+    if (!username || !password)
       return res.status(400).json({ success: false, message: "Username and password are required." });
-    }
-    if (username.length < 3) {
+    if (username.length < 3)
       return res.status(400).json({ success: false, message: "Username must be at least 3 characters." });
-    }
-    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+    if (!/^[a-zA-Z0-9_]+$/.test(username))
       return res.status(400).json({ success: false, message: "Username: letters, numbers, underscores only." });
-    }
-    if (password.length < 6) {
+    if (password.length < 6)
       return res.status(400).json({ success: false, message: "Password must be at least 6 characters." });
-    }
 
     const existing = await User.findOne({ username });
-    if (existing) {
+    if (existing)
       return res.status(409).json({ success: false, message: "Username already exists." });
-    }
 
-    // FIX: hash the password before saving
     const passwordHash = await bcrypt.hash(password, 12);
     await User.create({ username, passwordHash });
 
@@ -159,28 +233,23 @@ app.post("/login", async (req, res) => {
   try {
     const { username, password, rememberMe } = req.body;
 
-    if (!username || !password) {
+    if (!username || !password)
       return res.status(400).json({ success: false, message: "Username and password are required." });
-    }
 
-    // FIX: find by username only, then compare hash — not plaintext
     const user = await User.findOne({ username });
-    if (!user) {
+    if (!user)
       return res.status(401).json({ success: false, message: "Invalid username or password." });
-    }
 
     const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) {
+    if (!ok)
       return res.status(401).json({ success: false, message: "Invalid username or password." });
-    }
 
     req.session.user = user.username;
 
-    // FIX: honour rememberMe — 30-day vs browser-session cookie
     if (rememberMe) {
-      req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000;
+      req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000; // 30 days
     } else {
-      req.session.cookie.expires = false;
+      req.session.cookie.expires = false; // browser-session cookie
     }
 
     res.status(200).json({ success: true, message: "Login successful.", username: user.username });
@@ -190,7 +259,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// GET /me — called by auth_guard.js on every protected page load
+// GET /me — called by frontend isLoggedIn() on every page load
 app.get("/me", (req, res) => {
   if (req.session && req.session.user) {
     return res.json({ success: true, username: req.session.user });
@@ -207,18 +276,16 @@ app.post("/logout", (req, res) => {
   });
 });
 
-// ── GOOGLE SIGN-IN (GSI token verification) ──────────────────
+// ── GOOGLE SIGN-IN ──────────────────────────────────────
 const { OAuth2Client } = require("google-auth-library");
 const gsiClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 app.post("/auth/google", async (req, res) => {
   try {
     const { credential } = req.body;
-    if (!credential) {
+    if (!credential)
       return res.status(400).json({ success: false, message: "No credential provided." });
-    }
 
-    // Verify the JWT Google sent to the frontend
     const ticket = await gsiClient.verifyIdToken({
       idToken: credential,
       audience: process.env.GOOGLE_CLIENT_ID,
@@ -227,18 +294,12 @@ app.post("/auth/google", async (req, res) => {
     const googleEmail = payload.email;
     const googleName  = payload.name || googleEmail.split("@")[0];
 
-    // Find or create a user by email
     let user = await User.findOne({ email: googleEmail });
     if (!user) {
-      // Create a stub user — no password needed for OAuth users
       const safeUsername = googleName.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 20)
                          + "_" + Math.random().toString(36).slice(2, 6);
       const dummyHash = await bcrypt.hash(Math.random().toString(36), 12);
-      user = await User.create({
-        username:     safeUsername,
-        passwordHash: dummyHash,
-        email:        googleEmail,
-      });
+      user = await User.create({ username: safeUsername, passwordHash: dummyHash, email: googleEmail });
     }
 
     req.session.user = user.username;
@@ -249,15 +310,104 @@ app.post("/auth/google", async (req, res) => {
   }
 });
 
-// ── ATTENDANCE ───────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+//  UNIFIED USER DATA API  ← The core of the hybrid system
+//
+//  GET  /api/user-data   → returns the full data blob for
+//                          the logged-in user from MongoDB.
+//  POST /api/user-data   → upserts (creates or fully updates)
+//                          the data blob for the logged-in user.
+//
+//  Both endpoints require a valid session. The frontend
+//  loadUserData() / saveUserData() call these when logged in,
+//  and fall back to localStorage when not logged in.
+// ══════════════════════════════════════════════════════════
+
+// GET /api/user-data
+app.get("/api/user-data", requireAuth, async (req, res) => {
+  try {
+    const userId = req.session.user;
+
+    // Find the user's data document. If it doesn't exist yet
+    // (first login), return the default empty structure so
+    // the frontend always gets a consistent shape.
+    let doc = await UserData.findOne({ userId });
+
+    if (!doc) {
+      // Return defaults — don't create yet (no write on every GET)
+      return res.json({
+        success: true,
+        data: {
+          streaks:      {},
+          notes:        [],
+          badges:       [],
+          pomodoroStats:{ ai: 0, dsa: 0, projects: 0, extra: 0 },
+          aiProgress:   {},
+          dsaProgress:  {},
+          attendance:   {},
+          revisions:    [],
+          projects:     [],
+          pomoDuration: 25,
+        },
+      });
+    }
+
+    res.json({ success: true, data: doc.toObject() });
+  } catch (err) {
+    console.error("GET /api/user-data error:", err);
+    res.status(500).json({ success: false, message: "Failed to load user data." });
+  }
+});
+
+// POST /api/user-data
+app.post("/api/user-data", requireAuth, async (req, res) => {
+  try {
+    const userId = req.session.user;
+    const incoming = req.body;
+
+    // Validate: we only accept an object body
+    if (!incoming || typeof incoming !== "object") {
+      return res.status(400).json({ success: false, message: "Invalid data format." });
+    }
+
+    // Build the update payload — only allow known safe fields
+    // (never let the client overwrite userId itself)
+    const allowedFields = [
+      "streaks", "notes", "badges", "pomodoroStats",
+      "aiProgress", "dsaProgress", "attendance",
+      "revisions", "projects", "pomoDuration",
+    ];
+    const update = { updatedAt: new Date() };
+    allowedFields.forEach(field => {
+      if (incoming[field] !== undefined) {
+        update[field] = incoming[field];
+      }
+    });
+
+    // upsert:true → creates the document if it doesn't exist yet
+    // new:true    → returns the updated document
+    const doc = await UserData.findOneAndUpdate(
+      { userId },
+      { $set: update },
+      { upsert: true, new: true }
+    );
+
+    res.json({ success: true, message: "Data saved.", data: doc.toObject() });
+  } catch (err) {
+    console.error("POST /api/user-data error:", err);
+    res.status(500).json({ success: false, message: "Failed to save user data." });
+  }
+});
+
+// ── ATTENDANCE (legacy endpoints, now userId-scoped) ────
 
 app.post("/save-attendance", requireAuth, async (req, res) => {
   try {
     const { date, status } = req.body;
-    if (!date || !status) {
+    if (!date || !status)
       return res.status(400).json({ success: false, message: "Date and status are required." });
-    }
-    const record = await Attendance.create({ date, status });
+    // FIX: attach userId to every record
+    const record = await Attendance.create({ userId: req.session.user, date, status });
     res.status(201).json({ success: true, message: "Attendance saved.", data: record });
   } catch (err) {
     console.error("Save attendance error:", err);
@@ -267,22 +417,22 @@ app.post("/save-attendance", requireAuth, async (req, res) => {
 
 app.get("/get-attendance", requireAuth, async (req, res) => {
   try {
-    const records = await Attendance.find().sort({ createdAt: -1 });
+    // FIX: only return THIS user's records
+    const records = await Attendance.find({ userId: req.session.user }).sort({ createdAt: -1 });
     res.json({ success: true, data: records });
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed." });
   }
 });
 
-// ── PROGRESS ─────────────────────────────────────────────
+// ── PROGRESS (legacy, userId-scoped) ─────────────────────
 
 app.post("/save-progress", requireAuth, async (req, res) => {
   try {
     const { topic, completed } = req.body;
-    if (!topic) {
+    if (!topic)
       return res.status(400).json({ success: false, message: "Topic is required." });
-    }
-    const progress = await Progress.create({ topic, completed: completed ?? false });
+    const progress = await Progress.create({ userId: req.session.user, topic, completed: completed ?? false });
     res.status(201).json({ success: true, message: "Progress saved.", data: progress });
   } catch (err) {
     console.error("Save progress error:", err);
@@ -292,22 +442,21 @@ app.post("/save-progress", requireAuth, async (req, res) => {
 
 app.get("/get-progress", requireAuth, async (req, res) => {
   try {
-    const topics = await Progress.find().sort({ createdAt: -1 });
+    const topics = await Progress.find({ userId: req.session.user }).sort({ createdAt: -1 });
     res.json({ success: true, data: topics });
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed." });
   }
 });
 
-// ── NOTES ────────────────────────────────────────────────
+// ── NOTES (legacy, userId-scoped) ────────────────────────
 
 app.post("/save-text", requireAuth, async (req, res) => {
   try {
     const { title, content } = req.body;
-    if (!title || !content) {
+    if (!title || !content)
       return res.status(400).json({ success: false, message: "Title and content are required." });
-    }
-    const note = await Note.create({ title, content });
+    const note = await Note.create({ userId: req.session.user, title, content });
     res.status(201).json({ success: true, message: "Note saved.", data: note });
   } catch (err) {
     console.error("Save note error:", err);
@@ -317,7 +466,8 @@ app.post("/save-text", requireAuth, async (req, res) => {
 
 app.get("/get-text", requireAuth, async (req, res) => {
   try {
-    const notes = await Note.find().sort({ createdAt: -1 });
+    // FIX: only return THIS user's notes
+    const notes = await Note.find({ userId: req.session.user }).sort({ createdAt: -1 });
     res.status(200).json({ success: true, data: notes });
   } catch (err) {
     console.error("Get notes error:", err);
@@ -325,15 +475,14 @@ app.get("/get-text", requireAuth, async (req, res) => {
   }
 });
 
-// ── POMODORO ─────────────────────────────────────────────
+// ── POMODORO (legacy, userId-scoped) ─────────────────────
 
 app.post("/save-pomo", requireAuth, async (req, res) => {
   try {
     const { minutes } = req.body;
-    if (minutes === undefined || minutes === null) {
+    if (minutes === undefined || minutes === null)
       return res.status(400).json({ success: false, message: "Minutes are required." });
-    }
-    const pomo = await Pomodoro.create({ minutes });
+    const pomo = await Pomodoro.create({ userId: req.session.user, minutes });
     res.status(201).json({ success: true, message: "Pomodoro session saved.", data: pomo });
   } catch (err) {
     console.error("Save pomodoro error:", err);
@@ -343,21 +492,20 @@ app.post("/save-pomo", requireAuth, async (req, res) => {
 
 app.get("/get-pomo", requireAuth, async (req, res) => {
   try {
-    const sessions = await Pomodoro.find().sort({ date: -1 });
+    const sessions = await Pomodoro.find({ userId: req.session.user }).sort({ date: -1 });
     res.json({ success: true, data: sessions });
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed." });
   }
 });
 
-// ── ROADMAP ──────────────────────────────────────────────
+// ── ROADMAP ───────────────────────────────────────────────
 
 app.post("/save-roadmap", requireAuth, async (req, res) => {
   try {
     const { level, week, topic } = req.body;
-    if (!level || !week || !topic) {
+    if (!level || !week || !topic)
       return res.status(400).json({ success: false, message: "Level, week, and topic are required." });
-    }
     const roadmap = await Roadmap.create({ level, week, topic });
     res.status(201).json({ success: true, message: "Roadmap data saved.", data: roadmap });
   } catch (err) {
@@ -366,7 +514,7 @@ app.post("/save-roadmap", requireAuth, async (req, res) => {
   }
 });
 
-// ── PROFILE ──────────────────────────────────────────────
+// ── PROFILE ───────────────────────────────────────────────
 
 app.get("/profile", requireAuth, async (req, res) => {
   try {
@@ -381,9 +529,8 @@ app.get("/profile", requireAuth, async (req, res) => {
 
 app.post("/profile/password", requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
-  if (!newPassword || newPassword.length < 6) {
+  if (!newPassword || newPassword.length < 6)
     return res.json({ success: false, message: "New password must be at least 6 characters." });
-  }
   try {
     const user = await User.findOne({ username: req.session.user });
     if (!user) return res.status(404).json({ success: false, message: "Not found." });
@@ -405,6 +552,8 @@ app.delete("/profile", requireAuth, async (req, res) => {
     const ok = await bcrypt.compare(password || "", user.passwordHash);
     if (!ok) return res.json({ success: false, message: "Wrong password." });
     await User.deleteOne({ _id: user._id });
+    // Also delete all user data when account is deleted
+    await UserData.deleteOne({ userId: req.session.user });
     req.session.destroy(() => {
       res.clearCookie("rx_sid");
       res.json({ success: true });
@@ -414,8 +563,6 @@ app.delete("/profile", requireAuth, async (req, res) => {
   }
 });
 
-
-// POST /profile/username — change username
 app.post("/profile/username", requireAuth, async (req, res) => {
   const { newUsername, password } = req.body || {};
   if (!newUsername || newUsername.length < 3)
@@ -431,16 +578,18 @@ app.post("/profile/username", requireAuth, async (req, res) => {
       return res.json({ success: false, message: "That is already your username." });
     if (await User.findOne({ username: newUsername }))
       return res.json({ success: false, message: "Username already taken." });
+    const oldUsername = user.username;
     user.username = newUsername;
     await user.save();
-    req.session.user = newUsername; // keep session in sync
+    // Keep UserData in sync with the new username
+    await UserData.updateOne({ userId: oldUsername }, { $set: { userId: newUsername } });
+    req.session.user = newUsername;
     res.json({ success: true, username: newUsername });
   } catch (err) {
     res.status(500).json({ success: false, message: "Update failed." });
   }
 });
 
-// POST /profile/email — update email address
 app.post("/profile/email", requireAuth, async (req, res) => {
   const { newEmail, password } = req.body || {};
   if (!newEmail || !/.+@.+\..+/.test(newEmail))
@@ -460,7 +609,6 @@ app.post("/profile/email", requireAuth, async (req, res) => {
   }
 });
 
-// GET /profile/login-alerts — fetch current setting
 app.get("/profile/login-alerts", requireAuth, async (req, res) => {
   try {
     const user = await User.findOne({ username: req.session.user }).lean();
@@ -471,7 +619,6 @@ app.get("/profile/login-alerts", requireAuth, async (req, res) => {
   }
 });
 
-// POST /profile/login-alerts — toggle setting
 app.post("/profile/login-alerts", requireAuth, async (req, res) => {
   try {
     const user = await User.findOne({ username: req.session.user });
@@ -484,22 +631,18 @@ app.post("/profile/login-alerts", requireAuth, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.send("Backend is running 🚀");
+  res.send("RoadmapX Backend is running 🚀");
 });
 
-// ───────────────────────────────────────────────────────
-//  404 FALLBACK
-// ───────────────────────────────────────────────────────
+// ── 404 FALLBACK ──────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ success: false, message: "Route not found." });
 });
 
-// ───────────────────────────────────────────────────────
-//  START SERVER
-// ───────────────────────────────────────────────────────
+// ── START SERVER ──────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("Server running on port " + PORT);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
