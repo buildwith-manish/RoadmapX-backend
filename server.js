@@ -151,6 +151,41 @@ const userDataSchema = new mongoose.Schema({
   // Pomodoro duration setting
   pomoDuration: { type: Number, default: 25 },
 
+  // FIX: 7 fields that were previously only saved to localStorage
+  // AI section notes { topicKey: "note text" }
+  aiNotes: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  // DSA section notes { topicKey: "note text" }
+  dsaNotes: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  // Earned badge IDs (separate from the general badges array)
+  earnedBadges: {
+    type: [String],
+    default: [],
+  },
+  // Revision done tracking list
+  revisionsDoneList: {
+    type: [mongoose.Schema.Types.Mixed],
+    default: [],
+  },
+  // Structured AI roadmap progress — beginner/intermediate/advanced
+  aiStructBeginner: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  aiStructIntermediate: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+  aiStructAdvanced: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+  },
+
   updatedAt: { type: Date, default: Date.now },
 });
 const UserData = mongoose.model("UserData", userDataSchema);
@@ -360,16 +395,23 @@ app.get("/api/user-data", requireAuth, async (req, res) => {
       return res.json({
         success: true,
         data: {
-          streaks:      {},
-          notes:        [],
-          badges:       [],
-          pomodoroStats:{ ai: 0, dsa: 0, projects: 0, extra: 0 },
-          aiProgress:   {},
-          dsaProgress:  {},
-          attendance:   {},
-          revisions:    [],
-          projects:     [],
-          pomoDuration: 25,
+          streaks:              {},
+          notes:                [],
+          badges:               [],
+          pomodoroStats:        { ai: 0, dsa: 0, projects: 0, extra: 0 },
+          aiProgress:           {},
+          dsaProgress:          {},
+          attendance:           {},
+          revisions:            [],
+          projects:             [],
+          pomoDuration:         25,
+          aiNotes:              {},
+          dsaNotes:             {},
+          earnedBadges:         [],
+          revisionsDoneList:    [],
+          aiStructBeginner:     {},
+          aiStructIntermediate: {},
+          aiStructAdvanced:     {},
         },
       });
     }
@@ -398,6 +440,9 @@ app.post("/api/user-data", requireAuth, async (req, res) => {
       "streaks", "notes", "badges", "pomodoroStats",
       "aiProgress", "dsaProgress", "attendance",
       "revisions", "projects", "pomoDuration",
+      // FIX: 7 fields previously missing from backend sync
+      "aiNotes", "dsaNotes", "earnedBadges", "revisionsDoneList",
+      "aiStructBeginner", "aiStructIntermediate", "aiStructAdvanced",
     ];
     const update = { updatedAt: new Date() };
     allowedFields.forEach(field => {
