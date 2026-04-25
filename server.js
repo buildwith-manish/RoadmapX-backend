@@ -14,6 +14,8 @@
 //  6. All existing routes updated to scope queries by userId.
 // ═══════════════════════════════════════════════════════
 require('dotenv').config();
+const stepRoutes = require('./routes/stepRoutes');
+const roadmapRoutes = require('./routes/roadmapRoutes');
 const express    = require("express");
 const mongoose   = require("mongoose");
 const cors       = require("cors");
@@ -75,6 +77,8 @@ app.use(session({
 }));
 
 app.use(express.static(__dirname));
+app.use('/api/steps', stepRoutes);
+app.use('/api/roadmaps', roadmapRoutes);
 
 // ───────────────────────────────────────────────────────
 //  DATABASE CONNECTION
