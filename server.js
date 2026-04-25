@@ -229,13 +229,6 @@ const pomodoroSchema = new mongoose.Schema({
 });
 const Pomodoro = mongoose.model("Pomodoro", pomodoroSchema);
 
-// 7. Roadmap (legacy)
-const roadmapSchema = new mongoose.Schema({
-  level: { type: String, required: true },
-  week:  { type: Number, required: true },
-  topic: { type: String, required: true },
-});
-const Roadmap = mongoose.model("Roadmap", roadmapSchema);
 
 // ═══════════════════════════════════════════════════════
 //  AUTH MIDDLEWARE
@@ -570,20 +563,6 @@ app.get("/get-pomo", requireAuth, async (req, res) => {
   }
 });
 
-// ── ROADMAP ───────────────────────────────────────────────
-
-app.post("/save-roadmap", requireAuth, async (req, res) => {
-  try {
-    const { level, week, topic } = req.body;
-    if (!level || !week || !topic)
-      return res.status(400).json({ success: false, message: "Level, week, and topic are required." });
-    const roadmap = await Roadmap.create({ level, week, topic });
-    res.status(201).json({ success: true, message: "Roadmap data saved.", data: roadmap });
-  } catch (err) {
-    console.error("Save roadmap error:", err);
-    res.status(500).json({ success: false, message: "Server error saving roadmap data." });
-  }
-});
 
 // ── PROFILE ───────────────────────────────────────────────
 
