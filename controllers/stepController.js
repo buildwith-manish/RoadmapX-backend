@@ -1,5 +1,5 @@
-const Step       = require('../models/Step');
-const UserRoadmap = require('../models/UserRoadmap');
+const Step    = require('../models/Step');
+const Roadmap = require('../models/Roadmap');
 
 // ─────────────────────────────────────────────────────────────
 // POST /api/steps
@@ -18,7 +18,7 @@ const addStep = async (req, res) => {
     }
 
     // Verify the parent roadmap actually exists
-    const roadmap = await UserRoadmap.findById(roadmapId);
+    const roadmap = await Roadmap.findById(roadmapId);
     if (!roadmap) {
       return res.status(404).json({
         success: false,
@@ -50,7 +50,7 @@ const getSteps = async (req, res) => {
     const { roadmapId } = req.params;
 
     // Verify parent roadmap exists before querying steps
-    const roadmap = await UserRoadmap.findById(roadmapId);
+    const roadmap = await Roadmap.findById(roadmapId);
     if (!roadmap) {
       return res.status(404).json({
         success: false,

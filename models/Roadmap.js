@@ -26,9 +26,9 @@ const WeekSchema = new mongoose.Schema({
 /* ── Roadmap root schema ── */
 const RoadmapSchema = new mongoose.Schema({
   userId:   {
-    type:    String,
-    default: 'guest',
-    index:   true,                                          // indexed for future per-user queries
+    type:     String,
+    required: true,
+    index:    true,
   },
   title:    { type: String, required: true, trim: true, maxlength: 100 },
   level:    {

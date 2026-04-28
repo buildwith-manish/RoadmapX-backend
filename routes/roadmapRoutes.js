@@ -14,10 +14,11 @@
  *   GET    /api/roadmaps/:id/stats       → getRoadmapStats (single roadmap)
  */
 
-const express     = require('express');
-const rateLimit   = require('express-rate-limit');
-const router      = express.Router();
-const ctrl        = require('../controllers/roadmapController');
+const express       = require('express');
+const rateLimit     = require('express-rate-limit');
+const router        = express.Router();
+const ctrl          = require('../controllers/roadmapController');
+const { requireAuth } = require('../middleware/auth');
 
 /* ── Rate limiting ──────────────────────────────────────────
    Install: npm install express-rate-limit
@@ -40,6 +41,7 @@ const createLimiter = rateLimit({
   message:          { success: false, error: 'Too many create requests. Please wait a moment.' },
 });
 
+router.use(requireAuth);
 router.use(globalLimiter);
 
 /* ── Static routes FIRST (must come before /:id) ─────────── */

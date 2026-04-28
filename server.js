@@ -17,6 +17,7 @@ require('dotenv').config();
 const stepRoutes = require('./routes/stepRoutes');
 const roadmapRoutes = require('./routes/roadmapRoutes');
 const express    = require("express");
+const rateLimit  = require("express-rate-limit");
 const mongoose   = require("mongoose");
 const cors       = require("cors");
 const bcrypt     = require("bcryptjs");
@@ -189,6 +190,11 @@ const userDataSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: {},
   },
+  // Bug #9 fix: custom roadmaps were localStorage-only
+  customRoadmaps: {
+    type: [mongoose.Schema.Types.Mixed],
+    default: [],
+  },
 
   updatedAt: { type: Date, default: Date.now },
 });
@@ -231,6 +237,22 @@ const Pomodoro = mongoose.model("Pomodoro", pomodoroSchema);
 
 
 // ═══════════════════════════════════════════════════════
+//  RATE LIMITERS  (Bug #5 fix — brute-force protection)
+// ═══════════════════════════════════════════════════════
+
+// Max 10 auth attempts (register or login) per IP per 15 minutes.
+// After 10 failures the attacker must wait — passwords stay safe.
+const authLimiter = rateLimit({
+  windowMs:        15 * 60 * 1000, // 15 minutes
+  max:             10,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message:         { success: false, message: "Too many attempts. Please try again in 15 minutes." },
+  // Skip successful responses so only failures count against the limit
+  skipSuccessfulRequests: true,
+});
+
+// ═══════════════════════════════════════════════════════
 //  AUTH MIDDLEWARE
 // ═══════════════════════════════════════════════════════
 function requireAuth(req, res, next) {
@@ -245,7 +267,7 @@ function requireAuth(req, res, next) {
 // ── AUTH ─────────────────────────────────────────────────
 
 // POST /register
-app.post("/register", async (req, res) => {
+app.post("/register", authLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
 
@@ -273,7 +295,7 @@ app.post("/register", async (req, res) => {
 });
 
 // POST /login
-app.post("/login", async (req, res) => {
+app.post("/login", authLimiter, async (req, res) => {
   try {
     const { username, password, rememberMe } = req.body;
 
@@ -409,6 +431,7 @@ app.get("/api/user-data", requireAuth, async (req, res) => {
           aiStructBeginner:     {},
           aiStructIntermediate: {},
           aiStructAdvanced:     {},
+          customRoadmaps:       [],
         },
       });
     }
@@ -440,6 +463,8 @@ app.post("/api/user-data", requireAuth, async (req, res) => {
       // FIX: 7 fields previously missing from backend sync
       "aiNotes", "dsaNotes", "earnedBadges", "revisionsDoneList",
       "aiStructBeginner", "aiStructIntermediate", "aiStructAdvanced",
+      // Bug #9 fix: custom roadmaps were localStorage-only
+      "customRoadmaps",
     ];
     const update = { updatedAt: new Date() };
     allowedFields.forEach(field => {
@@ -684,6 +709,20 @@ app.post("/profile/login-alerts", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send("RoadmapX Backend is running 🚀");
+});
+
+// ── GLOBAL ERROR HANDLER ──────────────────────────────────
+// Must be defined with 4 parameters so Express treats it as
+// an error-handling middleware (not a regular route).
+// Without this, unhandled throws reach Express's built-in
+// handler which returns an HTML page, breaking JSON clients.
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  console.error("[unhandled error]", err);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    success: false,
+    message: err.message || "An unexpected server error occurred.",
+  });
 });
 
 // ── 404 FALLBACK ──────────────────────────────────────────

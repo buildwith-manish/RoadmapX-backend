@@ -1,6 +1,10 @@
 const express                              = require('express');
 const router                               = express.Router();
 const { addStep, getSteps, completeStep }  = require('../controllers/stepController');
+const { requireAuth }                      = require('../middleware/auth');
+
+// Protect all step routes — must be logged in
+router.use(requireAuth);
 
 // POST   /api/steps              → add a step to a roadmap
 router.post('/',            addStep);

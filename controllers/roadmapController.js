@@ -113,6 +113,7 @@ exports.createRoadmap = async (req, res) => {
     const emojiMap = { Beginner: '🟢', Intermediate: '🟡', Advanced: '🔴' };
 
     const roadmap = await Roadmap.create({
+      userId:   req.session.user,
       title:    safeTitle,
       level:    safeLevel,
       emoji:    emojiMap[safeLevel] || '📚',
@@ -134,7 +135,7 @@ exports.createRoadmap = async (req, res) => {
 ══════════════════════════════════════════════════════ */
 exports.getAllRoadmaps = async (req, res) => {
   try {
-    const raw = await Roadmap.find({}, {
+    const raw = await Roadmap.find({ userId: req.session.user }, {
       title: 1, level: 1, emoji: 1, createdAt: 1, updatedAt: 1, weeks: 1,
     }).lean();
 
@@ -173,6 +174,9 @@ exports.getRoadmap = async (req, res) => {
     const roadmap = await Roadmap.findById(req.params.id).lean();
     if (!roadmap) {
       return res.status(404).json({ success: false, error: 'Roadmap not found.' });
+    }
+    if (roadmap.userId !== req.session.user) {
+      return res.status(403).json({ success: false, error: 'Forbidden.' });
     }
     res.json({ success: true, roadmap });
   } catch (err) {
@@ -215,6 +219,13 @@ exports.updateRoadmap = async (req, res) => {
       return res.status(400).json({ success: false, error: 'No valid fields provided for update.' });
     }
 
+    // Ownership check before update
+    const existing = await Roadmap.findById(req.params.id).lean();
+    if (!existing) return res.status(404).json({ success: false, error: 'Roadmap not found.' });
+    if (existing.userId !== req.session.user) {
+      return res.status(403).json({ success: false, error: 'Forbidden.' });
+    }
+
     const roadmap = await Roadmap.findByIdAndUpdate(
       req.params.id,
       { $set: updates },
@@ -237,10 +248,14 @@ exports.updateRoadmap = async (req, res) => {
 exports.deleteRoadmap = async (req, res) => {
   if (rejectBadId(req, res)) return;
   try {
-    const result = await Roadmap.findByIdAndDelete(req.params.id);
+    const result = await Roadmap.findById(req.params.id);
     if (!result) {
       return res.status(404).json({ success: false, error: 'Roadmap not found.' });
     }
+    if (result.userId !== req.session.user) {
+      return res.status(403).json({ success: false, error: 'Forbidden.' });
+    }
+    await Roadmap.findByIdAndDelete(req.params.id);
     res.json({ success: true });
   } catch (err) {
     console.error('deleteRoadmap:', err);
@@ -297,6 +312,9 @@ exports.updateDay = async (req, res) => {
     if (!roadmap) {
       return res.status(404).json({ success: false, error: 'Roadmap not found.' });
     }
+    if (roadmap.userId !== req.session.user) {
+      return res.status(403).json({ success: false, error: 'Forbidden.' });
+    }
 
     const found = findDay(roadmap, dayNumber);
     if (!found) {
@@ -347,6 +365,9 @@ exports.manageTask = async (req, res) => {
     const roadmap = await Roadmap.findById(req.params.id);
     if (!roadmap) {
       return res.status(404).json({ success: false, error: 'Roadmap not found.' });
+    }
+    if (roadmap.userId !== req.session.user) {
+      return res.status(403).json({ success: false, error: 'Forbidden.' });
     }
 
     const found = findDay(roadmap, dayNumber);
@@ -428,6 +449,9 @@ exports.getRoadmapStats = async (req, res) => {
     if (!roadmap) {
       return res.status(404).json({ success: false, error: 'Roadmap not found.' });
     }
+    if (roadmap.userId !== req.session.user) {
+      return res.status(403).json({ success: false, error: 'Forbidden.' });
+    }
     const stats = computeStats(roadmap);
     res.json({ success: true, stats });
   } catch (err) {
@@ -445,6 +469,7 @@ exports.getRoadmapStats = async (req, res) => {
 exports.getGlobalStats = async (req, res) => {
   try {
     const [result] = await Roadmap.aggregate([
+      { $match: { userId: req.session.user } },
       { $unwind: '$weeks' },
       { $unwind: '$weeks.days' },
       {
