@@ -22,8 +22,26 @@ const mongoose   = require("mongoose");
 const cors       = require("cors");
 const bcrypt     = require("bcryptjs");
 const session    = require("express-session");
-const MongoStore = require("connect-mongo").default || require("connect-mongo"); // v5+/v6 compat
+const MongoStore = require("connect-mongo"); // connect-mongo v6+
 const app        = express();
+
+// ── CRYPTO + MAILER (used by password reset & email verification) ──
+const crypto     = require("crypto");
+const nodemailer = require("nodemailer");
+
+const TOKEN_TTL_MS  = 1000 * 60 * 30; // 30 min — password reset links
+const VERIFY_TTL_MS = 1000 * 60 * 60 * 24; // 24 h — email verify links (also declared below for clarity)
+
+const mailer = nodemailer.createTransport({
+  host:   process.env.SMTP_HOST,
+  port:   Number(process.env.SMTP_PORT) || 587,
+  secure: false,
+  auth:   { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
+
+function hashToken(raw) {
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
 
 // ───────────────────────────────────────────────────────
 //  MIDDLEWARE
@@ -272,66 +290,6 @@ function requireAuth(req, res, next) {
 // ═══════════════════════════════════════════════════════
 
 // ── AUTH ─────────────────────────────────────────────────
-
-// POST /register
-app.post("/register", authLimiter, async (req, res) => {
-  try {
-    const { username, password } = req.body;
-
-    if (!username || !password)
-      return res.status(400).json({ success: false, message: "Username and password are required." });
-    if (username.length < 3)
-      return res.status(400).json({ success: false, message: "Username must be at least 3 characters." });
-    if (!/^[a-zA-Z0-9_]+$/.test(username))
-      return res.status(400).json({ success: false, message: "Username: letters, numbers, underscores only." });
-    if (password.length < 6)
-      return res.status(400).json({ success: false, message: "Password must be at least 6 characters." });
-
-    const existing = await User.findOne({ username });
-    if (existing)
-      return res.status(409).json({ success: false, message: "Username already exists." });
-
-    const passwordHash = await bcrypt.hash(password, 12);
-    await User.create({ username, passwordHash });
-
-    res.status(201).json({ success: true, message: "User registered successfully." });
-  } catch (err) {
-    console.error("Register error:", err);
-    res.status(500).json({ success: false, message: "Server error during registration." });
-  }
-});
-
-// POST /login
-app.post("/login", authLimiter, async (req, res) => {
-  try {
-    const { username, password, rememberMe } = req.body;
-
-    if (!username || !password)
-      return res.status(400).json({ success: false, message: "Username and password are required." });
-
-    const user = await User.findOne({ username });
-    if (!user)
-      return res.status(401).json({ success: false, message: "Invalid username or password." });
-
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok)
-      return res.status(401).json({ success: false, message: "Invalid username or password." });
-
-    req.session.user = user.username;
-    tagSession(req);
-
-    if (rememberMe) {
-      req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000; // 30 days
-    } else {
-      req.session.cookie.expires = false; // browser-session cookie
-    }
-
-    res.status(200).json({ success: true, message: "Login successful.", username: user.username });
-  } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ success: false, message: "Server error during login." });
-  }
-});
 
 // GET /me — called by frontend isLoggedIn() on every page load
 app.get("/me", (req, res) => {
@@ -772,14 +730,6 @@ function parseDevice(ua) {
   return `${browser} on ${os}`;
 }
 
-// 2) Helper to require an authenticated user.
-function requireAuth(req, res, next) {
-  if (!req.session || !req.session.user) {
-    return res.status(401).json({ success: false, message: "Not signed in." });
-  }
-  next();
-}
-
 // 3) GET /sessions  — list all active sessions for the current user
 app.get("/sessions", requireAuth, async (req, res) => {
   try {
@@ -1085,41 +1035,6 @@ app.post("/2fa/verify-login", async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════
-//  RoadmapX — Password Reset (forgot / reset) backend
-//  Add to your Express app next to /login, /register, /me.
-//
-//  Install once:
-//    npm install nodemailer crypto
-//
-//  Add to .env:
-//    SMTP_HOST=smtp.example.com
-//    SMTP_PORT=587
-//    SMTP_USER=postmaster@example.com
-//    SMTP_PASS=...
-//    MAIL_FROM="RoadmapX <no-reply@roadmapx.app>"
-//    APP_URL=http://127.0.0.1:5500   # your frontend origin
-//
-//  User schema must have: { username, email, passwordHash,
-//                           resetTokenHash, resetTokenExpires }
-// ═══════════════════════════════════════════════════════
-
-const crypto     = require("crypto");
-const nodemailer = require("nodemailer");
-
-const TOKEN_TTL_MS = 1000 * 60 * 30; // 30 minutes
-
-const mailer = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT) || 587,
-  secure: false,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-});
-
-function hashToken(raw) {
-  return crypto.createHash("sha256").update(raw).digest("hex");
-}
-
 // 1) POST /forgot-password  body: { email }
 //    Always responds success — never reveal whether the email exists.
 app.post("/forgot-password", async (req, res) => {
@@ -1205,23 +1120,6 @@ app.post("/reset-password", async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════
-//  RoadmapX — Email Verification on Signup
-//  Add to your Express app. Replaces your existing /register
-//  and /login bodies (or merge if you already customised them).
-//
-//  User schema additions required:
-//    emailVerified           : Boolean  (default false)
-//    verifyTokenHash         : String
-//    verifyTokenExpires      : Date
-//
-//  Reuses the mailer + hashToken() + crypto from
-//  backend_password_reset_snippet.js. If that file isn't
-//  loaded, copy those helpers in here too.
-// ═══════════════════════════════════════════════════════
-
-const VERIFY_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
-
 async function sendVerificationEmail(user) {
   const rawToken = crypto.randomBytes(32).toString("hex");
   user.verifyTokenHash    = hashToken(rawToken);
@@ -1249,7 +1147,7 @@ If you didn't sign up, you can ignore this message.`,
 
 // 1) /register — create unverified account + send verification email.
 //    body: { username, email, password }
-app.post("/register", async (req, res) => {
+app.post("/register", authLimiter, async (req, res) => {
   const { username, email, password } = req.body || {};
   if (!username || !email || !password) {
     return res.json({ success: false, message: "All fields are required." });
@@ -1284,8 +1182,8 @@ app.post("/register", async (req, res) => {
 });
 
 // 2) /login — refuse unverified accounts.
-//    Wrap this around your existing /login logic.
-app.post("/login", async (req, res) => {
+//    Includes authLimiter (brute-force protection) + tagSession (device tracking).
+app.post("/login", authLimiter, async (req, res) => {
   const { username, password, remember } = req.body || {};
   if (!username || !password) {
     return res.json({ success: false, message: "Missing credentials." });
@@ -1305,6 +1203,7 @@ app.post("/login", async (req, res) => {
   }
 
   req.session.user = user.username;
+  tagSession(req); // tag device/IP metadata for sessions page
   if (remember) {
     req.session.cookie.maxAge = 1000 * 60 * 60 * 24 * 30; // 30 days
   } else {

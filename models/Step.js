@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const stepSchema = new mongoose.Schema({
   roadmapId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'UserRoadmap',
+    ref: 'Roadmap',
     required: true,
   },
   title: {
