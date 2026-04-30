@@ -733,7 +733,6 @@ app.get("/", (req, res) => {
 //  No new npm packages required.
 // ═══════════════════════════════════════════════════════
 
-const mongoose = require("mongoose");
 
 // 1) Middleware — call this AFTER req.session.user is set
 //    (i.e. inside /login and /auth/google success branches,
@@ -1104,7 +1103,6 @@ app.post("/2fa/verify-login", async (req, res) => {
 // ═══════════════════════════════════════════════════════
 
 const crypto     = require("crypto");
-const bcrypt     = require("bcrypt");
 const nodemailer = require("nodemailer");
 
 const TOKEN_TTL_MS = 1000 * 60 * 30; // 30 minutes
