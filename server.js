@@ -318,6 +318,7 @@ app.post("/login", authLimiter, async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid username or password." });
 
     req.session.user = user.username;
+    tagSession(req);
 
     if (rememberMe) {
       req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -386,6 +387,7 @@ app.post("/auth/google", async (req, res) => {
     }
 
     req.session.user = user.username;
+    tagSession(req);
     res.json({ success: true, username: user.username, email: googleEmail });
   } catch (err) {
     console.error("Google auth error:", err);
