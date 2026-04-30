@@ -100,6 +100,13 @@ const userSchema = new mongoose.Schema({
   email:        { type: String, default: "" },
   loginAlerts:  { type: Boolean, default: false },
   createdAt:    { type: Date, default: Date.now },
+  twoFactorEnabled:     { type: Boolean, default: false },
+  twoFactorSecret:      { type: String, default: "" },
+  emailVerified:        { type: Boolean, default: false },
+  verifyTokenHash:      { type: String },
+  verifyTokenExpires:   { type: Date },
+  resetTokenHash:       { type: String },
+  resetTokenExpires:    { type: Date },
 });
 const User = mongoose.model("User", userSchema);
 
@@ -715,6 +722,654 @@ app.get("/", (req, res) => {
 // Must be defined with 4 parameters so Express treats it as
 // an error-handling middleware (not a regular route).
 // Without this, unhandled throws reach Express's built-in
+
+// ═══════════════════════════════════════════════════════
+//  RoadmapX — Sessions & Devices management
+//
+//  Builds on backend_remember_snippet.js (express-session +
+//  connect-mongo). On every login we tag req.session with
+//  device metadata so users can later see and revoke them.
+//
+//  No new npm packages required.
+// ═══════════════════════════════════════════════════════
+
+const mongoose = require("mongoose");
+
+// 1) Middleware — call this AFTER req.session.user is set
+//    (i.e. inside /login and /auth/google success branches,
+//     right before res.json({ success: true })).
+//
+//    Usage in /login:
+//      req.session.user = user.username;
+//      tagSession(req);
+function tagSession(req) {
+  const ua = req.headers["user-agent"] || "Unknown device";
+  req.session.meta = {
+    ua,
+    ip:        req.ip,
+    createdAt: new Date().toISOString(),
+    device:    parseDevice(ua),
+  };
+}
+
+function parseDevice(ua) {
+  const u = ua.toLowerCase();
+  let os = "Unknown OS";
+  if (u.includes("windows"))      os = "Windows";
+  else if (u.includes("mac os"))  os = "macOS";
+  else if (u.includes("iphone"))  os = "iOS";
+  else if (u.includes("ipad"))    os = "iPadOS";
+  else if (u.includes("android")) os = "Android";
+  else if (u.includes("linux"))   os = "Linux";
+
+  let browser = "Browser";
+  if (u.includes("edg/"))             browser = "Edge";
+  else if (u.includes("chrome/"))     browser = "Chrome";
+  else if (u.includes("firefox/"))    browser = "Firefox";
+  else if (u.includes("safari/"))     browser = "Safari";
+
+  return `${browser} on ${os}`;
+}
+
+// 2) Helper to require an authenticated user.
+function requireAuth(req, res, next) {
+  if (!req.session || !req.session.user) {
+    return res.status(401).json({ success: false, message: "Not signed in." });
+  }
+  next();
+}
+
+// 3) GET /sessions  — list all active sessions for the current user
+app.get("/sessions", requireAuth, async (req, res) => {
+  try {
+    const coll = mongoose.connection.collection("sessions"); // connect-mongo default
+    const all  = await coll.find({}).toArray();
+
+    const username = req.session.user;
+    const out = [];
+
+    for (const row of all) {
+      let parsed;
+      try { parsed = JSON.parse(row.session); } catch (_) { continue; }
+      if (!parsed || parsed.user !== username) continue;
+
+      out.push({
+        id:        row._id,
+        device:    parsed.meta?.device    || "Unknown device",
+        ua:        parsed.meta?.ua        || "",
+        ip:        parsed.meta?.ip        || "",
+        createdAt: parsed.meta?.createdAt || null,
+        expiresAt: row.expires || null,
+        current:   row._id === req.sessionID,
+      });
+    }
+
+    out.sort((a, b) => (a.current ? -1 : b.current ? 1 : 0));
+    res.json({ success: true, sessions: out });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Could not load sessions." });
+  }
+});
+
+// 4) DELETE /sessions/:id  — revoke a specific session
+app.delete("/sessions/:id", requireAuth, async (req, res) => {
+  try {
+    const coll = mongoose.connection.collection("sessions");
+    const row  = await coll.findOne({ _id: req.params.id });
+    if (!row) return res.json({ success: false, message: "Session not found." });
+
+    let parsed;
+    try { parsed = JSON.parse(row.session); } catch (_) {}
+    if (!parsed || parsed.user !== req.session.user) {
+      return res.status(403).json({ success: false, message: "Not allowed." });
+    }
+
+    await coll.deleteOne({ _id: req.params.id });
+
+    // If the user revoked their own current session, kill the cookie too.
+    if (req.params.id === req.sessionID) {
+      req.session.destroy(() => {
+        res.clearCookie("rx_sid");
+        res.json({ success: true, signedOut: true });
+      });
+      return;
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Could not revoke session." });
+  }
+});
+
+// 5) POST /sessions/revoke-others  — sign out everywhere except here
+app.post("/sessions/revoke-others", requireAuth, async (req, res) => {
+  try {
+    const coll = mongoose.connection.collection("sessions");
+    const all  = await coll.find({}).toArray();
+    const username   = req.session.user;
+    const currentId  = req.sessionID;
+    const toDelete   = [];
+
+    for (const row of all) {
+      if (row._id === currentId) continue;
+      let parsed;
+      try { parsed = JSON.parse(row.session); } catch (_) { continue; }
+      if (parsed && parsed.user === username) toDelete.push(row._id);
+    }
+
+    if (toDelete.length) {
+      await coll.deleteMany({ _id: { $in: toDelete } });
+    }
+    res.json({ success: true, revoked: toDelete.length });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Could not revoke sessions." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  RoadmapX — Two-Factor Authentication (TOTP)
+//
+//  npm install speakeasy qrcode
+//
+//  User schema additions:
+//    twoFactorEnabled    : Boolean  (default false)
+//    twoFactorSecret     : String   (base32, set during setup)
+//    twoFactorBackupHashes: [String] (sha256 of single-use backup codes)
+//
+//  Flow:
+//    1) Logged-in user calls /2fa/setup → gets QR code + secret.
+//    2) User scans into Google Authenticator / Authy / 1Password.
+//    3) User submits a code to /2fa/enable → 2FA is on, backup codes returned.
+//    4) On future /login, if 2FA is enabled, the response is:
+//         { success:false, code:"2FA_REQUIRED", challengeId }
+//       Frontend collects the code and calls /2fa/verify-login.
+//    5) /2fa/disable requires a current TOTP code.
+// ═══════════════════════════════════════════════════════
+
+const speakeasy = require("speakeasy");
+const QRCode    = require("qrcode");
+// Reuses `crypto`, `hashToken`, `requireAuth`, `tagSession` from earlier snippets.
+
+// In-memory pending-login store (keyed by random challengeId).
+// For production with multiple servers, move this to Redis or Mongo.
+const pendingLogins = new Map(); // challengeId -> { username, remember, expires }
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, p] of pendingLogins) if (p.expires < now) pendingLogins.delete(id);
+}, 60_000);
+
+function newBackupCodes(n = 10) {
+  const codes = [];
+  for (let i = 0; i < n; i++) {
+    // Format: XXXX-XXXX (uppercase alphanumeric)
+    const raw = crypto.randomBytes(5).toString("hex").toUpperCase();
+    codes.push(`${raw.slice(0, 4)}-${raw.slice(4, 8)}`);
+  }
+  return codes;
+}
+
+// 1) /2fa/setup  — generate a secret + QR for the logged-in user
+app.post("/2fa/setup", requireAuth, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.session.user });
+    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    if (user.twoFactorEnabled) {
+      return res.json({ success: false, message: "2FA is already enabled." });
+    }
+
+    const secret = speakeasy.generateSecret({
+      name: `RoadmapX (${user.username})`,
+      issuer: "RoadmapX",
+      length: 20,
+    });
+
+    // Stash provisionally — only marked "enabled" after /2fa/enable succeeds.
+    user.twoFactorSecret = secret.base32;
+    await user.save();
+
+    const otpauthUrl = secret.otpauth_url;
+    const qrDataUrl  = await QRCode.toDataURL(otpauthUrl);
+
+    res.json({
+      success: true,
+      secret:  secret.base32,
+      qrDataUrl,
+      otpauthUrl,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Setup failed." });
+  }
+});
+
+// 2) /2fa/enable  body: { code }
+app.post("/2fa/enable", requireAuth, async (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.json({ success: false, message: "Code required." });
+
+  try {
+    const user = await User.findOne({ username: req.session.user });
+    if (!user || !user.twoFactorSecret) {
+      return res.json({ success: false, message: "Run setup first." });
+    }
+    const ok = speakeasy.totp.verify({
+      secret:   user.twoFactorSecret,
+      encoding: "base32",
+      token:    String(code).replace(/\s/g, ""),
+      window:   1,
+    });
+    if (!ok) return res.json({ success: false, message: "Invalid code. Try again." });
+
+    const backupCodes = newBackupCodes();
+    user.twoFactorEnabled       = true;
+    user.twoFactorBackupHashes  = backupCodes.map(hashToken);
+    await user.save();
+
+    res.json({ success: true, backupCodes });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Could not enable 2FA." });
+  }
+});
+
+// 3) /2fa/disable  body: { code }
+app.post("/2fa/disable", requireAuth, async (req, res) => {
+  const { code } = req.body || {};
+  try {
+    const user = await User.findOne({ username: req.session.user });
+    if (!user || !user.twoFactorEnabled) {
+      return res.json({ success: false, message: "2FA is not enabled." });
+    }
+    const ok = speakeasy.totp.verify({
+      secret:   user.twoFactorSecret,
+      encoding: "base32",
+      token:    String(code || "").replace(/\s/g, ""),
+      window:   1,
+    });
+    if (!ok) return res.json({ success: false, message: "Invalid code." });
+
+    user.twoFactorEnabled      = false;
+    user.twoFactorSecret       = undefined;
+    user.twoFactorBackupHashes = [];
+    await user.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Could not disable 2FA." });
+  }
+});
+
+// 4) /2fa/status  — used by the settings page
+app.get("/2fa/status", requireAuth, async (req, res) => {
+  const user = await User.findOne({ username: req.session.user });
+  res.json({
+    success: true,
+    enabled: !!(user && user.twoFactorEnabled),
+  });
+});
+
+// 5) Modify your existing /login: AFTER password check passes,
+//    BEFORE setting req.session.user, insert this block:
+//
+//    if (user.twoFactorEnabled) {
+//      const challengeId = crypto.randomBytes(24).toString("hex");
+//      pendingLogins.set(challengeId, {
+//        username: user.username,
+//        remember: !!remember,
+//        expires:  Date.now() + 5 * 60 * 1000, // 5 min
+//      });
+//      return res.json({ success: false, code: "2FA_REQUIRED", challengeId });
+//    }
+//    req.session.user = user.username;
+//    tagSession(req);
+//    ...
+
+// 6) /2fa/verify-login  body: { challengeId, code }
+app.post("/2fa/verify-login", async (req, res) => {
+  const { challengeId, code } = req.body || {};
+  if (!challengeId || !code) {
+    return res.json({ success: false, message: "Missing fields." });
+  }
+  const pending = pendingLogins.get(challengeId);
+  if (!pending || pending.expires < Date.now()) {
+    pendingLogins.delete(challengeId);
+    return res.json({ success: false, message: "Login session expired. Sign in again." });
+  }
+
+  try {
+    const user = await User.findOne({ username: pending.username });
+    if (!user || !user.twoFactorEnabled) {
+      pendingLogins.delete(challengeId);
+      return res.json({ success: false, message: "Invalid request." });
+    }
+
+    const cleaned = String(code).replace(/\s/g, "").toUpperCase();
+    let ok = false;
+
+    // Try TOTP first (6 digits)
+    if (/^\d{6}$/.test(cleaned)) {
+      ok = speakeasy.totp.verify({
+        secret:   user.twoFactorSecret,
+        encoding: "base32",
+        token:    cleaned,
+        window:   1,
+      });
+    }
+
+    // Then try a backup code (one-time use)
+    if (!ok && /^[A-Z0-9]{4}-?[A-Z0-9]{4}$/.test(cleaned)) {
+      const normalized = cleaned.includes("-") ? cleaned : `${cleaned.slice(0,4)}-${cleaned.slice(4)}`;
+      const h = hashToken(normalized);
+      const idx = (user.twoFactorBackupHashes || []).indexOf(h);
+      if (idx !== -1) {
+        ok = true;
+        user.twoFactorBackupHashes.splice(idx, 1);
+        await user.save();
+      }
+    }
+
+    if (!ok) return res.json({ success: false, message: "Invalid code." });
+
+    pendingLogins.delete(challengeId);
+    req.session.user = user.username;
+    tagSession(req);
+    if (pending.remember) {
+      req.session.cookie.maxAge = 1000 * 60 * 60 * 24 * 30;
+    } else {
+      req.session.cookie.expires = false;
+    }
+    res.json({
+      success: true,
+      username: user.username,
+      backupCodesRemaining: (user.twoFactorBackupHashes || []).length,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Verification failed." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  RoadmapX — Password Reset (forgot / reset) backend
+//  Add to your Express app next to /login, /register, /me.
+//
+//  Install once:
+//    npm install nodemailer crypto
+//
+//  Add to .env:
+//    SMTP_HOST=smtp.example.com
+//    SMTP_PORT=587
+//    SMTP_USER=postmaster@example.com
+//    SMTP_PASS=...
+//    MAIL_FROM="RoadmapX <no-reply@roadmapx.app>"
+//    APP_URL=http://127.0.0.1:5500   # your frontend origin
+//
+//  User schema must have: { username, email, passwordHash,
+//                           resetTokenHash, resetTokenExpires }
+// ═══════════════════════════════════════════════════════
+
+const crypto     = require("crypto");
+const bcrypt     = require("bcrypt");
+const nodemailer = require("nodemailer");
+
+const TOKEN_TTL_MS = 1000 * 60 * 30; // 30 minutes
+
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT) || 587,
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
+
+function hashToken(raw) {
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+// 1) POST /forgot-password  body: { email }
+//    Always responds success — never reveal whether the email exists.
+app.post("/forgot-password", async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) {
+    return res.json({ success: false, message: "Email is required." });
+  }
+
+  try {
+    const user = await User.findOne({ email: String(email).toLowerCase() });
+
+    if (user) {
+      const rawToken = crypto.randomBytes(32).toString("hex");
+      user.resetTokenHash    = hashToken(rawToken);
+      user.resetTokenExpires = new Date(Date.now() + TOKEN_TTL_MS);
+      await user.save();
+
+      const link = `${process.env.APP_URL}/reset-password.html` +
+                   `?token=${rawToken}&u=${encodeURIComponent(user.username)}`;
+
+      await mailer.sendMail({
+        from: process.env.MAIL_FROM,
+        to:   user.email,
+        subject: "Reset your RoadmapX password",
+        text:
+`Hi ${user.username},
+
+We received a request to reset your RoadmapX password.
+Click the link below within 30 minutes to choose a new password:
+
+${link}
+
+If you didn't request this, you can ignore this email.`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "If that email is registered, a reset link has been sent.",
+    });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Could not send reset email." });
+  }
+});
+
+// 2) POST /reset-password  body: { token, username, password }
+app.post("/reset-password", async (req, res) => {
+  const { token, username, password } = req.body || {};
+  if (!token || !username || !password) {
+    return res.json({ success: false, message: "Missing fields." });
+  }
+  if (password.length < 6) {
+    return res.json({
+      success: false,
+      message: "Password must be at least 6 characters.",
+    });
+  }
+
+  try {
+    const user = await User.findOne({ username });
+    if (!user || !user.resetTokenHash || !user.resetTokenExpires) {
+      return res.json({ success: false, message: "Invalid or expired link." });
+    }
+    if (user.resetTokenExpires.getTime() < Date.now()) {
+      return res.json({ success: false, message: "This link has expired." });
+    }
+    if (user.resetTokenHash !== hashToken(token)) {
+      return res.json({ success: false, message: "Invalid or expired link." });
+    }
+
+    user.passwordHash       = await bcrypt.hash(password, 10);
+    user.resetTokenHash     = undefined;
+    user.resetTokenExpires  = undefined;
+    await user.save();
+
+    return res.json({ success: true, message: "Password updated. You can log in now." });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Could not reset password." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  RoadmapX — Email Verification on Signup
+//  Add to your Express app. Replaces your existing /register
+//  and /login bodies (or merge if you already customised them).
+//
+//  User schema additions required:
+//    emailVerified           : Boolean  (default false)
+//    verifyTokenHash         : String
+//    verifyTokenExpires      : Date
+//
+//  Reuses the mailer + hashToken() + crypto from
+//  backend_password_reset_snippet.js. If that file isn't
+//  loaded, copy those helpers in here too.
+// ═══════════════════════════════════════════════════════
+
+const VERIFY_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
+
+async function sendVerificationEmail(user) {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  user.verifyTokenHash    = hashToken(rawToken);
+  user.verifyTokenExpires = new Date(Date.now() + VERIFY_TTL_MS);
+  await user.save();
+
+  const link = `${process.env.APP_URL}/verify-email.html` +
+               `?token=${rawToken}&u=${encodeURIComponent(user.username)}`;
+
+  await mailer.sendMail({
+    from: process.env.MAIL_FROM,
+    to:   user.email,
+    subject: "Confirm your RoadmapX email",
+    text:
+`Hi ${user.username},
+
+Welcome to RoadmapX! Please confirm your email by clicking
+the link below within 24 hours:
+
+${link}
+
+If you didn't sign up, you can ignore this message.`,
+  });
+}
+
+// 1) /register — create unverified account + send verification email.
+//    body: { username, email, password }
+app.post("/register", async (req, res) => {
+  const { username, email, password } = req.body || {};
+  if (!username || !email || !password) {
+    return res.json({ success: false, message: "All fields are required." });
+  }
+  if (password.length < 6) {
+    return res.json({ success: false, message: "Password must be at least 6 characters." });
+  }
+
+  try {
+    const normEmail = String(email).toLowerCase();
+    const exists = await User.findOne({ $or: [{ username }, { email: normEmail }] });
+    if (exists) {
+      return res.json({ success: false, message: "Username or email already in use." });
+    }
+
+    const user = new User({
+      username,
+      email: normEmail,
+      passwordHash: await bcrypt.hash(password, 10),
+      emailVerified: false,
+    });
+    await user.save();
+    await sendVerificationEmail(user);
+
+    return res.json({
+      success: true,
+      message: "Account created. Check your inbox to verify your email.",
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Could not create account." });
+  }
+});
+
+// 2) /login — refuse unverified accounts.
+//    Wrap this around your existing /login logic.
+app.post("/login", async (req, res) => {
+  const { username, password, remember } = req.body || {};
+  if (!username || !password) {
+    return res.json({ success: false, message: "Missing credentials." });
+  }
+
+  const user = await User.findOne({ username });
+  if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+    return res.json({ success: false, message: "Invalid username or password." });
+  }
+
+  if (!user.emailVerified) {
+    return res.json({
+      success: false,
+      code: "EMAIL_NOT_VERIFIED",
+      message: "Please verify your email before logging in.",
+    });
+  }
+
+  req.session.user = user.username;
+  if (remember) {
+    req.session.cookie.maxAge = 1000 * 60 * 60 * 24 * 30; // 30 days
+  } else {
+    req.session.cookie.expires = false;
+  }
+  return res.json({ success: true, username: user.username });
+});
+
+// 3) /verify-email  body: { token, username }
+app.post("/verify-email", async (req, res) => {
+  const { token, username } = req.body || {};
+  if (!token || !username) {
+    return res.json({ success: false, message: "Invalid verification link." });
+  }
+  try {
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.json({ success: false, message: "Invalid verification link." });
+    }
+    if (user.emailVerified) {
+      return res.json({ success: true, message: "Email already verified." });
+    }
+    if (
+      !user.verifyTokenHash ||
+      !user.verifyTokenExpires ||
+      user.verifyTokenExpires.getTime() < Date.now() ||
+      user.verifyTokenHash !== hashToken(token)
+    ) {
+      return res.json({
+        success: false,
+        code: "EXPIRED",
+        message: "This link is invalid or has expired.",
+      });
+    }
+
+    user.emailVerified      = true;
+    user.verifyTokenHash    = undefined;
+    user.verifyTokenExpires = undefined;
+    await user.save();
+
+    return res.json({ success: true, message: "Email verified! You can log in now." });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Verification failed." });
+  }
+});
+
+// 4) /resend-verification  body: { email }
+//    Always responds success — never reveals if the email exists.
+app.post("/resend-verification", async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.json({ success: false, message: "Email is required." });
+
+  try {
+    const user = await User.findOne({ email: String(email).toLowerCase() });
+    if (user && !user.emailVerified) {
+      await sendVerificationEmail(user);
+    }
+    return res.json({
+      success: true,
+      message: "If that account needs verification, a new email has been sent.",
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Could not send email." });
+  }
+});
 // handler which returns an HTML page, breaking JSON clients.
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   console.error("[unhandled error]", err);
