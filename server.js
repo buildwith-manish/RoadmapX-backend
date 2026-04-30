@@ -22,7 +22,7 @@ const mongoose   = require("mongoose");
 const cors       = require("cors");
 const bcrypt     = require("bcryptjs");
 const session    = require("express-session");
-const MongoStore = require("connect-mongo"); // connect-mongo v6+
+const MongoStore = require("connect-mongo").default ?? require("connect-mongo");
 const app        = express();
 
 // ── CRYPTO + MAILER (used by password reset & email verification) ──
