@@ -16,6 +16,7 @@
 require('dotenv').config();
 const stepRoutes = require('./routes/stepRoutes');
 const roadmapRoutes = require('./routes/roadmapRoutes');
+const leaderboardRoutes = require('./routes/leaderboardRoute');
 const express    = require("express");
 const rateLimit  = require("express-rate-limit");
 const mongoose   = require("mongoose");
@@ -98,6 +99,7 @@ app.use(session({
 app.use(express.static(__dirname));
 app.use('/api/steps', stepRoutes);
 app.use('/api/roadmaps', roadmapRoutes);
+app.use('/api/leaderboard', leaderboardRoutes);
 
 // ───────────────────────────────────────────────────────
 //  DATABASE CONNECTION
