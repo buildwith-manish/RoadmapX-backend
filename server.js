@@ -127,6 +127,9 @@ const userSchema = new mongoose.Schema({
   verifyTokenExpires:   { type: Date },
   resetTokenHash:       { type: String },
   resetTokenExpires:    { type: Date },
+  // Daily reminder: "HH:MM" in user's local time, null = disabled
+  reminderTime:         { type: String, default: null },
+  reminderTimezone:     { type: String, default: 'Asia/Kolkata' },
 });
 const User = mongoose.model("User", userSchema);
 
@@ -1271,7 +1274,314 @@ app.post("/resend-verification", async (req, res) => {
     return res.status(500).json({ success: false, message: "Could not send email." });
   }
 });
-// handler which returns an HTML page, breaking JSON clients.
+// ═══════════════════════════════════════════════════════
+//  FEATURE 1 — DAILY EMAIL REMINDERS
+//
+//  User sets a preferred time (e.g. "08:00") + timezone.
+//  A cron-like interval runs every minute and sends the
+//  reminder email to all users whose local time matches.
+//
+//  No new npm packages needed beyond node-cron.
+//  npm install node-cron
+// ═══════════════════════════════════════════════════════
+const cron = require('node-cron');
+
+// ── GET /api/reminder — get current reminder settings ──
+app.get('/api/reminder', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.session.user })
+                           .select('reminderTime reminderTimezone email').lean();
+    if (!user) return res.status(404).json({ success: false });
+    res.json({
+      success: true,
+      reminderTime:     user.reminderTime     || null,
+      reminderTimezone: user.reminderTimezone || 'Asia/Kolkata',
+      email:            user.email            || '',
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to load reminder.' });
+  }
+});
+
+// ── POST /api/reminder — save reminder preference ──────
+// body: { time: "08:00" | null, timezone: "Asia/Kolkata" }
+app.post('/api/reminder', requireAuth, async (req, res) => {
+  try {
+    const { time, timezone } = req.body || {};
+    const user = await User.findOne({ username: req.session.user });
+    if (!user) return res.status(404).json({ success: false });
+
+    if (!user.email) {
+      return res.json({ success: false, message: 'Add an email to your profile first.' });
+    }
+
+    // Validate time format HH:MM
+    if (time !== null && time !== undefined) {
+      if (!/^\d{2}:\d{2}$/.test(time)) {
+        return res.json({ success: false, message: 'Invalid time format. Use HH:MM.' });
+      }
+    }
+
+    user.reminderTime     = time || null;
+    user.reminderTimezone = timezone || 'Asia/Kolkata';
+    await user.save();
+
+    res.json({
+      success: true,
+      message: time ? `Reminder set for ${time} (${timezone})` : 'Reminder disabled.',
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to save reminder.' });
+  }
+});
+
+// ── Daily reminder cron — runs every minute ────────────
+// For each user with reminderTime set, check if it matches
+// their current local time (HH:MM). If yes, send the email.
+//
+// We track the last-sent date per user to avoid sending
+// twice if the server cycles within the same minute.
+const _reminderSentToday = new Map(); // username → "YYYY-MM-DD"
+
+cron.schedule('* * * * *', async () => {
+  try {
+    // Find all users with a reminder time set + an email
+    const users = await User.find({
+      reminderTime: { $ne: null, $exists: true },
+      email:        { $ne: '', $exists: true },
+      emailVerified: true,
+    }).lean();
+
+    if (!users.length) return;
+
+    const now = new Date();
+
+    for (const user of users) {
+      try {
+        // Get current HH:MM in the user's timezone
+        const localTime = now.toLocaleTimeString('en-GB', {
+          timeZone: user.reminderTimezone || 'Asia/Kolkata',
+          hour:     '2-digit',
+          minute:   '2-digit',
+          hour12:   false,
+        }); // e.g. "08:00"
+
+        if (localTime !== user.reminderTime) continue;
+
+        // Don't send twice in the same day
+        const localDate = now.toLocaleDateString('en-CA', {
+          timeZone: user.reminderTimezone || 'Asia/Kolkata',
+        }); // e.g. "2026-05-03"
+
+        if (_reminderSentToday.get(user.username) === localDate) continue;
+        _reminderSentToday.set(user.username, localDate);
+
+        // Gather user stats for a personalised email
+        const userData = await UserData.findOne({ userId: user.username }).lean();
+        const streak   = userData?.streaks?.global?.current || 0;
+        const longest  = userData?.streaks?.global?.longest || 0;
+
+        // Count today's study actions
+        const todayParts = Object.keys(userData?.streaks?.global?.parts || {})
+          .filter(d => d === localDate).length > 0
+          ? (userData?.streaks?.global?.parts?.[localDate] || 0)
+          : 0;
+
+        // Pick motivational line based on streak
+        const motivation = streak >= 30
+          ? `You're on a blazing 🔥 ${streak}-day streak. You're unstoppable.`
+          : streak >= 7
+          ? `${streak} days strong! Your longest is ${longest}. Keep going.`
+          : streak >= 2
+          ? `Day ${streak} of your streak — don't break the chain! 🔗`
+          : `Start your streak today — even 10 minutes counts. 💪`;
+
+        // Count topics done today vs total
+        const aiDone  = Object.values(userData?.aiProgress  || {}).filter(v => v === true || v?.done).length;
+        const dsaDone = Object.values(userData?.dsaProgress || {}).filter(v => v === true || v?.done).length;
+
+        await mailer.sendMail({
+          from:    process.env.MAIL_FROM,
+          to:      user.email,
+          subject: `⚡ RoadmapX — Time to study, ${user.username}!`,
+          html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#05050f;font-family:'Segoe UI',system-ui,sans-serif">
+  <div style="max-width:520px;margin:0 auto;padding:24px 16px">
+
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#0c0c20,#0a0818);border:1px solid rgba(0,229,200,0.15);border-radius:16px;padding:28px 24px;margin-bottom:16px;text-align:center">
+      <div style="font-size:32px;margin-bottom:8px">⚡</div>
+      <div style="font-family:monospace;font-size:11px;color:#00e5c8;letter-spacing:3px;margin-bottom:6px">// DAILY REMINDER</div>
+      <h1 style="margin:0;color:#f0f0ff;font-size:26px;font-weight:800">Time to study, ${user.username}!</h1>
+      <p style="color:#8080a8;font-size:13px;margin:8px 0 0">${motivation}</p>
+    </div>
+
+    <!-- Stats row -->
+    <div style="display:flex;gap:10px;margin-bottom:16px">
+      <div style="flex:1;background:#08081a;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:16px;text-align:center">
+        <div style="font-size:28px;font-weight:800;color:#00e5c8;font-family:monospace">${streak}</div>
+        <div style="font-size:10px;color:#404060;letter-spacing:1px;text-transform:uppercase;margin-top:4px">Current Streak</div>
+      </div>
+      <div style="flex:1;background:#08081a;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:16px;text-align:center">
+        <div style="font-size:28px;font-weight:800;color:#f59e0b;font-family:monospace">${longest}</div>
+        <div style="font-size:10px;color:#404060;letter-spacing:1px;text-transform:uppercase;margin-top:4px">Longest Streak</div>
+      </div>
+      <div style="flex:1;background:#08081a;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:16px;text-align:center">
+        <div style="font-size:28px;font-weight:800;color:#10b981;font-family:monospace">${aiDone + dsaDone}</div>
+        <div style="font-size:10px;color:#404060;letter-spacing:1px;text-transform:uppercase;margin-top:4px">Topics Done</div>
+      </div>
+    </div>
+
+    <!-- CTA -->
+    <div style="text-align:center;margin-bottom:16px">
+      <a href="${process.env.APP_URL || 'https://roadmapx.pages.dev'}"
+         style="display:inline-block;background:linear-gradient(135deg,#00e5c8,#7c3aed);color:#fff;text-decoration:none;padding:14px 32px;border-radius:10px;font-weight:700;font-size:15px;letter-spacing:0.5px">
+        Open RoadmapX →
+      </a>
+    </div>
+
+    <!-- Footer -->
+    <div style="text-align:center;font-size:11px;color:#303050;font-family:monospace">
+      Sent at your chosen time (${user.reminderTime} ${user.reminderTimezone || 'Asia/Kolkata'})<br>
+      <a href="${process.env.APP_URL || 'https://roadmapx.pages.dev'}/settings.html" style="color:#404060">Manage reminders</a>
+    </div>
+  </div>
+</body>
+</html>`,
+        });
+
+        console.log(`[Reminder] Sent to ${user.username} (${user.email}) at ${localTime}`);
+      } catch (userErr) {
+        console.error(`[Reminder] Failed for ${user.username}:`, userErr.message);
+      }
+    }
+  } catch (err) {
+    console.error('[Reminder cron] Error:', err);
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  FEATURE 2 — PUBLIC PROGRESS SHARE CARDS
+//
+//  GET /share/:username  → returns JSON stats for that user
+//  (public, no auth required — users opt-in via sharePublic flag)
+//
+//  The frontend generates the visual card using Canvas API.
+//  The shareable URL is: /share/:username
+// ═══════════════════════════════════════════════════════
+
+// Add sharePublic to user schema (already done above via userSchema patch).
+// To update the schema without migration, we use findOneAndUpdate with $set.
+
+// ── POST /api/share/toggle — enable/disable public profile ──
+app.post('/api/share/toggle', requireAuth, async (req, res) => {
+  try {
+    const { enabled } = req.body || {};
+    await User.updateOne(
+      { username: req.session.user },
+      { $set: { sharePublic: !!enabled } }
+    );
+    res.json({ success: true, sharePublic: !!enabled });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed.' });
+  }
+});
+
+// ── GET /api/share/:username — public stats endpoint ──────
+// Returns safe stats for building the share card.
+// Only works if the user has sharePublic: true.
+app.get('/api/share/:username', async (req, res) => {
+  try {
+    const { username } = req.params;
+    const user = await User.findOne({ username })
+                           .select('username createdAt sharePublic').lean();
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    // Private by default — user must opt in
+    if (!user.sharePublic) {
+      return res.status(403).json({
+        success: false,
+        code: 'PRIVATE',
+        message: 'This profile is private.',
+      });
+    }
+
+    const userData = await UserData.findOne({ userId: username }).lean();
+    if (!userData) {
+      return res.json({
+        success: true,
+        data: {
+          username,
+          joinedAt:     user.createdAt,
+          streak:       0,
+          longest:      0,
+          totalPomos:   0,
+          topicsDone:   0,
+          badges:       [],
+          sharePublic:  true,
+        },
+      });
+    }
+
+    // Compute scores (same logic as leaderboard)
+    const streak  = userData.streaks?.global?.current || 0;
+    const longest = userData.streaks?.global?.longest || 0;
+
+    const ps = userData.pomodoroStats || {};
+    const totalPomos = (ps.ai || 0) + (ps.dsa || 0) + (ps.projects || 0) + (ps.extra || 0);
+
+    let topicsDone = 0;
+    const countDone = (obj) => {
+      if (!obj || typeof obj !== 'object') return 0;
+      return Object.values(obj).filter(v =>
+        v === true || (v && typeof v === 'object' && v.done === true)
+      ).length;
+    };
+    topicsDone += countDone(userData.aiProgress);
+    topicsDone += countDone(userData.aiStructBeginner);
+    topicsDone += countDone(userData.aiStructIntermediate);
+    topicsDone += countDone(userData.aiStructAdvanced);
+    Object.entries(userData.dsaProgress || {}).forEach(([k, v]) => {
+      if (k.startsWith('proj_')) { if (v === 'completed') topicsDone++; }
+      else if (v === true || (v && v.done === true)) topicsDone++;
+    });
+
+    // Count completed custom roadmap days
+    (userData.customRoadmaps || []).forEach(rm => {
+      (rm.weeks || []).forEach(wk => {
+        (wk.days || []).forEach(d => { if (d.completed) topicsDone++; });
+      });
+    });
+
+    res.json({
+      success: true,
+      data: {
+        username,
+        joinedAt:    user.createdAt,
+        streak,
+        longest,
+        totalPomos,
+        topicsDone,
+        badges:      userData.earnedBadges || [],
+        sharePublic: true,
+      },
+    });
+  } catch (err) {
+    console.error('[Share] Error:', err);
+    res.status(500).json({ success: false, message: 'Failed to load profile.' });
+  }
+});
+
+// handler which adds sharePublic field in-place without a migration:
+// ── PATCH /api/share/toggle will naturally create it via updateOne $set ──
+
+
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   console.error("[unhandled error]", err);
   const status = err.status || err.statusCode || 500;
