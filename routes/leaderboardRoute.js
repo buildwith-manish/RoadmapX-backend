@@ -1,25 +1,22 @@
 // ═══════════════════════════════════════════════════════
-//  RoadmapX — Leaderboard API Route
-//  GET /api/leaderboard?category=streak&limit=50
+//  RoadmapX — Leaderboard API Route  (v2 — field-correct)
+//  GET /api/leaderboard?category=streak|pomodoro|progress|allround&limit=50
 //
-//  Categories:
-//    streak      — best current streak (from streaks object)
-//    pomodoro    — total pomodoro sessions (pomodoroStats sum)
-//    progress    — most roadmap days completed (customRoadmaps)
-//    allround    — composite score across all three
-//
-//  Privacy: only username is exposed, no emails or IDs.
-//  Caching: results are cached in-memory for 60 seconds to
-//  avoid hammering MongoDB on every page load.
+//  Fixes in v2:
+//   - streaks: reads global.current correctly (was iterating wrong keys)
+//   - aiProgress / dsaProgress: values are { done: true } objects, not booleans
+//   - aiStruct*: same — { done: true } objects
+//   - Zero-score tie-breaking by join date so ranking is stable
+//   - Cache busted to avoid serving stale zero scores
 // ═══════════════════════════════════════════════════════
 
-const express = require('express');
-const router  = express.Router();
+const express  = require('express');
+const router   = express.Router();
 const mongoose = require('mongoose');
 
-// ── In-memory cache (per category) ──────────────────────
-const _cache = new Map(); // key: category → { data, ts }
-const CACHE_TTL = 60 * 1000; // 60 seconds
+// ── In-memory cache ──────────────────────────────────────
+const _cache   = new Map();
+const CACHE_TTL = 60 * 1000; // 60 s
 
 function getCached(key) {
   const hit = _cache.get(key);
@@ -30,76 +27,120 @@ function setCache(key, data) {
   _cache.set(key, { data, ts: Date.now() });
 }
 
-// ── Helper: compute scores from a UserData document ─────
+// ── Count "done" entries in an aiProgress / dsaProgress map ──
+// Values look like:  { done: true, completedDate: "2025-01-01" }
+// OR legacy boolean: true
+function countDoneInProgressMap(obj) {
+  if (!obj || typeof obj !== 'object') return 0;
+  return Object.values(obj).filter(v => {
+    if (v === true) return true;                          // legacy boolean
+    if (v && typeof v === 'object') return v.done === true; // normal object
+    return false;
+  }).length;
+}
+
+// ── Compute all scores from one UserData document ────────
 function computeScores(doc) {
-  // 1. Best streak across all roadmap types
+
+  // ── 1. STREAK ─────────────────────────────────────────
+  // Schema: streaks is Mixed, structured as:
+  //   { global: { current, longest, lastDate, history, parts }, ai: {...}, dsa: {...} }
   let bestStreak = 0;
   try {
     const streaks = doc.streaks || {};
-    Object.values(streaks).forEach(s => {
-      const v = typeof s === 'object' ? (s.current || s.count || 0) : (Number(s) || 0);
-      if (v > bestStreak) bestStreak = v;
+
+    // Prefer the unified global streak
+    if (streaks.global && typeof streaks.global === 'object') {
+      const cur = Number(streaks.global.current) || 0;
+      const lng = Number(streaks.global.longest)  || 0;
+      bestStreak = Math.max(cur, lng);
+    }
+
+    // Fallback: per-type streaks (legacy users without global)
+    ['ai', 'dsa', 'proj', 'extra'].forEach(key => {
+      if (!streaks[key] || typeof streaks[key] !== 'object') return;
+      const cur = Number(streaks[key].current) || 0;
+      const lng = Number(streaks[key].longest)  || 0;
+      if (cur > bestStreak) bestStreak = cur;
+      if (lng > bestStreak) bestStreak = lng;
     });
   } catch (_) {}
 
-  // 2. Total pomodoro sessions (sum of all categories)
+  // ── 2. POMODORO ───────────────────────────────────────
+  // Schema: pomodoroStats = { ai: N, dsa: N, projects: N, extra: N }
   let totalPomo = 0;
   try {
     const ps = doc.pomodoroStats || {};
-    totalPomo = (ps.ai || 0) + (ps.dsa || 0) + (ps.projects || 0) + (ps.extra || 0);
+    totalPomo =
+      (Number(ps.ai)       || 0) +
+      (Number(ps.dsa)      || 0) +
+      (Number(ps.projects) || 0) +
+      (Number(ps.extra)    || 0);
   } catch (_) {}
 
-  // 3. Completed roadmap days across all custom roadmaps
-  let completedDays = 0;
-  let totalDays = 0;
+  // ── 3. PROGRESS ───────────────────────────────────────
+  let progressScore = 0;
+
   try {
+    // a) Flat AI roadmap progress  { dayNum: { done: true, completedDate } }
+    progressScore += countDoneInProgressMap(doc.aiProgress);
+  } catch (_) {}
+
+  try {
+    // b) DSA progress — topic keys "t1","t2"... and project keys "proj_X"
+    const dsa = doc.dsaProgress || {};
+    Object.entries(dsa).forEach(([key, val]) => {
+      if (key.startsWith('proj_')) {
+        if (val === 'completed') progressScore++;
+      } else {
+        if (val === true || (val && typeof val === 'object' && val.done === true)) {
+          progressScore++;
+        }
+      }
+    });
+  } catch (_) {}
+
+  try {
+    // c) Structured AI roadmap (3 levels)
+    progressScore += countDoneInProgressMap(doc.aiStructBeginner);
+    progressScore += countDoneInProgressMap(doc.aiStructIntermediate);
+    progressScore += countDoneInProgressMap(doc.aiStructAdvanced);
+  } catch (_) {}
+
+  try {
+    // d) Custom roadmaps (week/day structure)
     const roadmaps = doc.customRoadmaps || [];
     roadmaps.forEach(rm => {
       (rm.weeks || []).forEach(wk => {
         (wk.days || []).forEach(d => {
-          totalDays++;
-          if (d.completed) completedDays++;
+          if (d.completed) progressScore++;
         });
       });
     });
   } catch (_) {}
 
-  // Also count AI/DSA structured progress as topics done
-  let topicsDone = 0;
-  try {
-    const countDone = (obj) => {
-      if (!obj || typeof obj !== 'object') return 0;
-      return Object.values(obj).filter(v => v === true || v === 'done' || v === 1).length;
-    };
-    topicsDone += countDone(doc.aiProgress) + countDone(doc.dsaProgress);
-    topicsDone += countDone(doc.aiStructBeginner) + countDone(doc.aiStructIntermediate) + countDone(doc.aiStructAdvanced);
-  } catch (_) {}
-
-  const progressScore = completedDays + topicsDone;
-
-  // 4. All-round composite (weighted)
+  // ── 4. ALL-ROUND composite ────────────────────────────
   const allround = Math.round(
-    bestStreak    * 10 +   // streak is hardest to maintain
-    totalPomo     * 2  +   // consistent focus time
-    progressScore * 3      // actual learning progress
+    bestStreak    * 10 +
+    totalPomo     * 3  +
+    progressScore * 5
   );
 
-  return { bestStreak, totalPomo, progressScore, allround, completedDays, topicsDone };
+  return { bestStreak, totalPomo, progressScore, allround };
 }
 
 // ── GET /api/leaderboard ─────────────────────────────────
 router.get('/', async (req, res) => {
   const category = (req.query.category || 'allround').toLowerCase();
   const limit    = Math.min(parseInt(req.query.limit) || 50, 100);
-  const validCategories = ['streak', 'pomodoro', 'progress', 'allround'];
 
+  const validCategories = ['streak', 'pomodoro', 'progress', 'allround'];
   if (!validCategories.includes(category)) {
     return res.status(400).json({ success: false, message: 'Invalid category.' });
   }
 
-  // Check cache
   const cacheKey = `${category}:${limit}`;
-  const cached = getCached(cacheKey);
+  const cached   = getCached(cacheKey);
   if (cached) {
     return res.json({ success: true, cached: true, data: cached });
   }
@@ -108,16 +149,14 @@ router.get('/', async (req, res) => {
     const UserData = mongoose.model('UserData');
     const User     = mongoose.model('User');
 
-    // Fetch all UserData documents (we need computed scores, can't sort in DB)
-    const allDocs = await UserData.find({}).lean();
+    const [allDocs, allUsers] = await Promise.all([
+      UserData.find({}).lean(),
+      User.find({}).select('username createdAt').lean(),
+    ]);
 
-    // Build scored list
-    const scored = allDocs.map(doc => {
-      const scores = computeScores(doc);
-      return { userId: doc.userId, ...scores };
-    });
+    const joinMap = {};
+    allUsers.forEach(u => { joinMap[u.username] = u.createdAt; });
 
-    // Sort by chosen category
     const sortKey = {
       streak:   'bestStreak',
       pomodoro: 'totalPomo',
@@ -125,87 +164,78 @@ router.get('/', async (req, res) => {
       allround: 'allround',
     }[category];
 
-    scored.sort((a, b) => b[sortKey] - a[sortKey]);
-    const top = scored.slice(0, limit);
+    const scored = allDocs.map(doc => ({
+      userId:   doc.userId,
+      joinedAt: joinMap[doc.userId] || null,
+      ...computeScores(doc),
+    }));
 
-    // Filter out zero-score entries for cleaner leaderboard
-    const nonZero = top.filter(e => e[sortKey] > 0);
-    const finalList = nonZero.length > 0 ? nonZero : top.slice(0, 10);
+    // Primary sort: score desc. Tie-break: earlier join date wins.
+    scored.sort((a, b) => {
+      const diff = b[sortKey] - a[sortKey];
+      if (diff !== 0) return diff;
+      const da = a.joinedAt ? new Date(a.joinedAt).getTime() : Infinity;
+      const db = b.joinedAt ? new Date(b.joinedAt).getTime() : Infinity;
+      return da - db;
+    });
 
-    // Get join dates for top users (for tiebreaking display)
-    const usernames = finalList.map(e => e.userId);
-    const users = await User.find({ username: { $in: usernames } })
-      .select('username createdAt').lean();
-    const joinMap = {};
-    users.forEach(u => { joinMap[u.username] = u.createdAt; });
+    const finalList = scored.slice(0, limit);
 
-    // Build final response (no sensitive data)
     const data = finalList.map((entry, idx) => ({
-      rank:        idx + 1,
-      username:    entry.userId,
+      rank:     idx + 1,
+      username: entry.userId,
       scores: {
         streak:   entry.bestStreak,
         pomodoro: entry.totalPomo,
         progress: entry.progressScore,
         allround: entry.allround,
       },
-      joinedAt: joinMap[entry.userId] || null,
+      joinedAt: entry.joinedAt,
     }));
 
     setCache(cacheKey, data);
     return res.json({ success: true, cached: false, category, data });
+
   } catch (err) {
-    console.error('Leaderboard error:', err);
+    console.error('[Leaderboard] GET / error:', err);
     return res.status(500).json({ success: false, message: 'Could not load leaderboard.' });
   }
 });
 
 // ── GET /api/leaderboard/me ──────────────────────────────
-// Returns the current user's rank + scores across all categories
 router.get('/me', async (req, res) => {
   if (!req.session || !req.session.user) {
     return res.status(401).json({ success: false, message: 'Not logged in.' });
   }
 
+  const userId = req.session.user;
+
   try {
     const UserData = mongoose.model('UserData');
     const allDocs  = await UserData.find({}).lean();
-    const userId   = req.session.user;
 
     const scored = allDocs.map(doc => ({
       userId: doc.userId,
       ...computeScores(doc),
     }));
 
-    const myDoc = scored.find(s => s.userId === userId);
-    if (!myDoc) {
-      return res.json({
-        success: true,
-        data: {
-          username: userId,
-          scores: { streak: 0, pomodoro: 0, progress: 0, allround: 0 },
-          ranks:  { streak: null, pomodoro: null, progress: null, allround: null },
-          totalUsers: scored.length,
-        },
-      });
-    }
+    const myEntry = scored.find(s => s.userId === userId);
 
-    // Compute rank in each category
     const rankIn = (key) => {
       const sorted = [...scored].sort((a, b) => b[key] - a[key]);
-      return sorted.findIndex(s => s.userId === userId) + 1;
+      const idx    = sorted.findIndex(s => s.userId === userId);
+      return idx >= 0 ? idx + 1 : null;
     };
+
+    const scores = myEntry
+      ? { streak: myEntry.bestStreak, pomodoro: myEntry.totalPomo, progress: myEntry.progressScore, allround: myEntry.allround }
+      : { streak: 0, pomodoro: 0, progress: 0, allround: 0 };
 
     return res.json({
       success: true,
       data: {
         username: userId,
-        scores: {
-          streak:   myDoc.bestStreak,
-          pomodoro: myDoc.totalPomo,
-          progress: myDoc.progressScore,
-          allround: myDoc.allround,
-        },
+        scores,
         ranks: {
           streak:   rankIn('bestStreak'),
           pomodoro: rankIn('totalPomo'),
@@ -215,8 +245,9 @@ router.get('/me', async (req, res) => {
         totalUsers: scored.length,
       },
     });
+
   } catch (err) {
-    console.error('Leaderboard /me error:', err);
+    console.error('[Leaderboard] GET /me error:', err);
     return res.status(500).json({ success: false, message: 'Could not fetch your rank.' });
   }
 });
