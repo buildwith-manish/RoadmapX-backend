@@ -1726,4 +1726,18 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
+
+  // Warn clearly about missing Google OAuth config
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    console.warn("⚠️  GOOGLE_CLIENT_ID is not set — Google Sign-In will not work.");
+  }
+  if (!process.env.GOOGLE_CLIENT_SECRET) {
+    console.warn("⚠️  GOOGLE_CLIENT_SECRET is not set — Google OAuth redirect flow will not work.");
+  }
+  if (!process.env.BACKEND_URL) {
+    console.warn("⚠️  BACKEND_URL is not set — defaulting to hardcoded URL for Google callback.");
+  }
+  if (!process.env.FRONTEND_URL) {
+    console.warn("⚠️  FRONTEND_URL is not set — defaulting to https://roadmapx.pages.dev for redirects.");
+  }
 });
