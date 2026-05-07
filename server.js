@@ -1331,7 +1331,7 @@ app.post('/auth/otp/send', authLimiter, async (req, res) => {
     await mailer.sendMail({
       from:    process.env.MAIL_FROM,
       to:      normEmail,
-      subject: `${otp} is your RoadmapX sign-in code`,
+      subject: `${otp} - Your RoadmapX sign-in code`,
       html: `
 <!DOCTYPE html>
 <html>
@@ -1460,7 +1460,7 @@ app.post('/auth/email/send-link', authLimiter, async (req, res) => {
     await mailer.sendMail({
       from:    process.env.MAIL_FROM,
       to:      normEmail,
-      subject: '🔑 Your RoadmapX sign-in link',
+      subject: 'Your RoadmapX sign-in link',
       html: `
 <!DOCTYPE html>
 <html>
@@ -1468,24 +1468,32 @@ app.post('/auth/email/send-link', authLimiter, async (req, res) => {
 <body style="margin:0;padding:0;background:#05050f;font-family:'Segoe UI',system-ui,sans-serif">
   <div style="max-width:480px;margin:0 auto;padding:32px 16px">
     <div style="background:linear-gradient(135deg,#0c0c20,#0a0818);border:1px solid rgba(0,229,200,0.15);border-radius:16px;padding:32px 28px;text-align:center">
-      <div style="font-size:36px;margin-bottom:12px">⚡</div>
+      <div style="font-size:36px;margin-bottom:12px">&#9889;</div>
       <h1 style="margin:0 0 8px;color:#f0f0ff;font-size:22px;font-weight:800">Sign in to RoadmapX</h1>
       <p style="color:#8080a8;font-size:14px;margin:0 0 28px;line-height:1.6">
         Click the button below to sign in instantly.<br>This link expires in <strong style="color:#00e5c8">15 minutes</strong>.
       </p>
-      <a href="${link}"
-         style="display:inline-block;background:linear-gradient(135deg,#00e5c8,#7c3aed);color:#fff;text-decoration:none;padding:14px 36px;border-radius:10px;font-weight:700;font-size:15px;letter-spacing:0.5px">
-        Sign In to RoadmapX →
-      </a>
-      <p style="color:#404060;font-size:12px;margin:24px 0 0;font-family:monospace">
-        If you didn't request this, you can safely ignore it.<br>
-        Link expires at ${new Date(Date.now() + MAGIC_TTL_MS).toUTCString()}
+      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center">
+        <a href="${link}"
+           style="display:inline-block;background:#00e5c8;color:#05050f;text-decoration:none;padding:14px 36px;border-radius:10px;font-weight:700;font-size:15px;letter-spacing:0.5px;mso-padding-alt:0;border:2px solid #00e5c8;">
+          &#8594; Sign In to RoadmapX
+        </a>
+      </td></tr></table>
+      <p style="color:#404060;font-size:11px;margin:24px 0 8px;font-family:monospace">
+        If the button does not work, copy and paste this link into your browser:
+      </p>
+      <p style="word-break:break-all;font-family:monospace;font-size:11px;color:#00e5c8;margin:0 0 20px;padding:10px;background:rgba(0,229,200,0.06);border-radius:6px;border:1px solid rgba(0,229,200,0.12);">
+        ${link}
+      </p>
+      <p style="color:#303050;font-size:11px;margin:0;font-family:monospace">
+        If you did not request this, you can safely ignore it.<br>
+        Expires: ${new Date(Date.now() + MAGIC_TTL_MS).toUTCString()}
       </p>
     </div>
   </div>
 </body>
 </html>`,
-      text: `Sign in to RoadmapX\n\nClick this link to sign in (expires in 15 minutes):\n${link}\n\nIf you didn't request this, ignore this email.`,
+      text: `Sign in to RoadmapX\n\nClick this link to sign in (expires in 15 minutes):\n\n${link}\n\nIf the link doesn't work, copy and paste it into your browser.\n\nIf you didn't request this, ignore this email.`,
     });
 
     return res.json(ok);
