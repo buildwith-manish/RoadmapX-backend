@@ -35,38 +35,25 @@ const VERIFY_TTL_MS = 1000 * 60 * 60 * 24; // 24 h — email verify links (also 
 const MAGIC_TTL_MS  = 1000 * 60 * 15; // 15 min — magic link sign-in tokens
 const OTP_TTL_MS    = 1000 * 60 * 10; // 10 min — email OTP codes
 
-// ── MAILER SETUP ─────────────────────────────────────────────────────────
-// Set these env vars on Render:
-//   SMTP_USER = manishnkotian11@gmail.com
-//   SMTP_PASS = (16-char Gmail App Password from myaccount.google.com → Security → App passwords)
-//   SMTP_HOST = (leave EMPTY for Gmail)
-//   MAIL_FROM = manishnkotian11@gmail.com
-// ─────────────────────────────────────────────────────────────────────────
-const _smtpUser = (process.env.SMTP_USER || '').trim();
-const _smtpHost = (process.env.SMTP_HOST || '').trim();
-const _smtpPass = (process.env.SMTP_PASS || '').trim();
+// Gmail via port 587 (STARTTLS) — port 465 is blocked on Render free tier
+const mailer = nodemailer.createTransport({
+  host:       'smtp.gmail.com',
+  port:       587,
+  secure:     false,   // STARTTLS (NOT SSL — port 465 SSL is blocked by Render)
+  requireTLS: true,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+  tls: { rejectUnauthorized: false },
+});
 
-// Auto-detect Gmail vs generic SMTP
-const _mailerConfig = (!_smtpHost && _smtpUser.toLowerCase().endsWith('@gmail.com'))
-  ? { service: 'gmail', auth: { user: _smtpUser, pass: _smtpPass } }
-  : {
-      host:       _smtpHost || 'smtp.gmail.com',
-      port:       Number(process.env.SMTP_PORT) || 587,
-      secure:     Number(process.env.SMTP_PORT) === 465,
-      requireTLS: true,
-      auth:       { user: _smtpUser, pass: _smtpPass },
-      tls:        { rejectUnauthorized: false },
-    };
-
-const mailer = nodemailer.createTransport(_mailerConfig);
-
-// Verify SMTP on startup — check Render logs to confirm emails will work
+// Log on startup so you can confirm in Render logs
 mailer.verify((err) => {
   if (err) {
-    console.error('❌ SMTP FAILED — OTP emails will not send:', err.message);
-    console.error('   → Set SMTP_USER, SMTP_PASS (and SMTP_HOST if not Gmail) in Render env vars');
+    console.error('SMTP FAILED:', err.message);
   } else {
-    console.log('✅ SMTP OK — emails will send normally');
+    console.log('SMTP OK — Gmail ready on port 587');
   }
 });
 
@@ -1435,7 +1422,7 @@ app.post('/auth/otp/send', authLimiter, async (req, res) => {
     await user.save();
 
     await mailer.sendMail({
-      from:    process.env.MAIL_FROM || _smtpUser,
+      from:    process.env.MAIL_FROM,
       to:      normEmail,
       subject: `${otp} - Your RoadmapX sign-in code`,
       html: `
