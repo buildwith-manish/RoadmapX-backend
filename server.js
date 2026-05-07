@@ -33,6 +33,7 @@ const nodemailer = require("nodemailer");
 const TOKEN_TTL_MS  = 1000 * 60 * 30; // 30 min — password reset links
 const VERIFY_TTL_MS = 1000 * 60 * 60 * 24; // 24 h — email verify links (also declared below for clarity)
 const MAGIC_TTL_MS  = 1000 * 60 * 15; // 15 min — magic link sign-in tokens
+const OTP_TTL_MS    = 1000 * 60 * 10; // 10 min — email OTP codes
 
 const mailer = nodemailer.createTransport({
   host:   process.env.SMTP_HOST,
@@ -131,6 +132,9 @@ const userSchema = new mongoose.Schema({
   // Magic link (passwordless email sign-in)
   magicTokenHash:       { type: String },
   magicTokenExpires:    { type: Date },
+  // Email OTP (6-digit code, 10 min TTL)
+  otpHash:              { type: String },
+  otpExpires:           { type: Date },
   // Daily reminder: "HH:MM" in user's local time, null = disabled
   reminderTime:         { type: String, default: null },
   reminderTimezone:     { type: String, default: 'Asia/Kolkata' },
@@ -1276,6 +1280,125 @@ app.post("/resend-verification", async (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: "Could not send email." });
+  }
+});
+
+// ═══════════════════════════════════════════════════════
+//  EMAIL OTP — PASSWORDLESS SIGN-IN WITH 6-DIGIT CODE
+//
+//  Flow:
+//  1. POST /auth/otp/send   { email }
+//     → generates a 6-digit OTP, hashes & stores it, emails it
+//  2. POST /auth/otp/verify { email, otp }
+//     → validates OTP, creates/finds user, sets session
+//
+//  Security:
+//  - OTP is 6 digits, 10-minute TTL, single-use
+//  - DB stores bcrypt hash only — never raw OTP
+//  - Rate-limited via authLimiter
+// ═══════════════════════════════════════════════════════
+
+// POST /auth/otp/send  body: { email }
+app.post('/auth/otp/send', authLimiter, async (req, res) => {
+  const { email } = req.body || {};
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ success: false, message: 'Valid email is required.' });
+  }
+
+  try {
+    const normEmail = email.toLowerCase().trim();
+    let user = await User.findOne({ email: normEmail });
+
+    if (!user) {
+      // Auto-create passwordless account for new email
+      const base = normEmail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 14);
+      const safeUsername = base + '_' + Math.random().toString(36).slice(2, 6);
+      const dummyHash = await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 10);
+      user = await User.create({
+        username:      safeUsername,
+        email:         normEmail,
+        passwordHash:  dummyHash,
+        emailVerified: true,
+      });
+    }
+
+    // Generate 6-digit OTP
+    const otp     = String(Math.floor(100000 + Math.random() * 900000));
+    user.otpHash    = await bcrypt.hash(otp, 10);
+    user.otpExpires = new Date(Date.now() + OTP_TTL_MS);
+    await user.save();
+
+    await mailer.sendMail({
+      from:    process.env.MAIL_FROM,
+      to:      normEmail,
+      subject: `${otp} is your RoadmapX sign-in code`,
+      html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#05050f;font-family:'Segoe UI',system-ui,sans-serif">
+  <div style="max-width:420px;margin:0 auto;padding:32px 16px">
+    <div style="background:linear-gradient(135deg,#0c0c20,#0a0818);border:1px solid rgba(0,229,200,0.15);border-radius:16px;padding:36px 28px;text-align:center">
+      <div style="font-size:32px;margin-bottom:12px">🔐</div>
+      <h1 style="margin:0 0 6px;color:#f0f0ff;font-size:20px;font-weight:800">Your sign-in code</h1>
+      <p style="color:#8080a8;font-size:13px;margin:0 0 28px">Enter this code in RoadmapX to sign in</p>
+      <div style="background:#08081a;border:1px solid rgba(0,229,200,0.2);border-radius:12px;padding:20px;margin-bottom:24px">
+        <div style="font-family:monospace;font-size:42px;font-weight:900;letter-spacing:10px;color:#00e5c8">${otp}</div>
+      </div>
+      <p style="color:#404060;font-size:12px;margin:0;font-family:monospace">
+        Expires in 10 minutes · Do not share this code
+      </p>
+    </div>
+  </div>
+</body>
+</html>`,
+      text: `Your RoadmapX sign-in code is: ${otp}\n\nExpires in 10 minutes. Do not share this code.`,
+    });
+
+    return res.json({ success: true, message: 'OTP sent to your email.' });
+  } catch (err) {
+    console.error('[OTP] send error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to send OTP. Try again.' });
+  }
+});
+
+// POST /auth/otp/verify  body: { email, otp }
+app.post('/auth/otp/verify', authLimiter, async (req, res) => {
+  const { email, otp } = req.body || {};
+  if (!email || !otp) {
+    return res.status(400).json({ success: false, message: 'Email and OTP are required.' });
+  }
+
+  try {
+    const normEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normEmail });
+
+    if (!user || !user.otpHash || !user.otpExpires) {
+      return res.json({ success: false, message: 'Invalid or expired code. Request a new one.' });
+    }
+    if (user.otpExpires.getTime() < Date.now()) {
+      user.otpHash = undefined; user.otpExpires = undefined;
+      await user.save();
+      return res.json({ success: false, code: 'EXPIRED', message: 'Code expired. Request a new one.' });
+    }
+    const match = await bcrypt.compare(String(otp).trim(), user.otpHash);
+    if (!match) {
+      return res.json({ success: false, message: 'Incorrect code. Please try again.' });
+    }
+
+    // ✅ Valid — consume OTP, create session
+    user.otpHash    = undefined;
+    user.otpExpires = undefined;
+    user.emailVerified = true;
+    await user.save();
+
+    req.session.user = user.username;
+    tagSession(req);
+
+    return res.json({ success: true, username: user.username });
+  } catch (err) {
+    console.error('[OTP] verify error:', err);
+    return res.status(500).json({ success: false, message: 'Server error. Try again.' });
   }
 });
 
