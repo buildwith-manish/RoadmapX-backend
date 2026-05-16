@@ -84,6 +84,9 @@ app.use(cors({
       "https://roadmapx.onrender.com",
       "https://roadmapx.pages.dev",
       "https://roadmapx-frontend.pages.dev",
+      "capacitor://localhost",
+      "http://localhost",
+      "https://localhost",
     ];
     if (!origin || allowed.includes(origin)) {
       callback(null, true);
